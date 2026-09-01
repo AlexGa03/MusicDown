@@ -1,0 +1,62 @@
+# ==============================================================================
+# Git Ignore (.gitignore) - Electron App Subdirectory
+# ==============================================================================
+
+# Dependencias locales
+node_modules/
+backend/venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compilación y empaquetado (Electron, Vite, PyInstaller)
+dist/
+build/
+release/
+out/
+squashfs-root/
+frontend/dist/
+frontend/node_modules/
+*.AppImage
+*.exe
+*.deb
+*.rpm
+*.dmg
+*.pkg
+
+# Binarios descargados dinámicamente en tiempo de ejecución
+backend/bin/yt-dlp*
+bin/yt-dlp*
+*.tmp
+.write_probe
+.write_test
+
+# Archivos de logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Configuraciones de usuario y datos en caliente
+userData/
+descargas/
+downloads/
+temp/
+tmp/
+.config/
+
+# Variables de entorno y secretos
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+
+# Archivos del sistema operativo y editores
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini
+.vscode/
+.idea/

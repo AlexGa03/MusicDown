@@ -1,0 +1,90 @@
+# ==============================================================================
+# Docker Context Ignore (.dockerignore) - MusicDown
+# ==============================================================================
+
+# Dependencias locales (se reinstalan limpiamente en el contenedor)
+node_modules/
+**/node_modules/
+backend/venv/
+**/venv/
+**/.venv/
+
+# Directorios de compilación y empaquetado
+dist/
+**/dist/
+build/
+**/build/
+release/
+**/release/
+out/
+**/out/
+squashfs-root/
+**/squashfs-root/
+*.AppImage
+*.exe
+*.deb
+*.rpm
+*.dmg
+*.pkg
+*.zip
+*.tar.gz
+
+# Cachés de Python y binarios descargados en tiempo de ejecución
+__pycache__/
+**/__pycache__/
+*.py[cod]
+**/*.py[cod]
+backend/bin/yt-dlp*
+**/bin/yt-dlp*
+
+# Archivos de logs
+*.log
+**/*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Configuraciones de usuario, datos locales y descargas temporales
+.config/
+**/.config/
+userData/
+**/userData/
+descargas/
+**/descargas/
+downloads/
+**/downloads/
+temp/
+**/temp/
+tmp/
+**/tmp/
+*.tmp
+.write_probe
+.write_test
+
+# Control de versiones y CI/CD
+.git/
+**/.git/
+.gitignore
+.gitattributes
+.github/
+**/.github/
+
+# Variables de entorno y credenciales sensibles
+.env
+.env.*
+*.env
+!.env.example
+
+# Archivos temporales del SO y editores
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+[Dd]esktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo

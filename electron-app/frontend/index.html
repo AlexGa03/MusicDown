@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Content-Security-Policy: solo recursos locales, sin eval, sin inline scripts externos -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; script-src 'self' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'">
+    <title>MusicDown</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        ::-webkit-scrollbar       { width: 6px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        .console-text { font-family: 'Courier New', Courier, monospace; }
+    </style>
+</head>
+<body class="bg-gray-900 text-white h-screen flex flex-col overflow-hidden select-none">
+
+    <!-- CABECERA -->
+    <header class="bg-gray-800 px-6 py-3 shadow-lg flex items-center justify-between"
+            style="-webkit-app-region: drag">
+        <h1 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">
+            MusicDown
+        </h1>
+        <span class="text-xs text-gray-500 font-mono">v2.0</span>
+    </header>
+
+    <!-- CONTENIDO PRINCIPAL -->
+    <main class="flex-1 flex overflow-hidden">
+
+        <!-- ── Columna Izquierda: Controles y Consola ── -->
+        <section class="w-1/2 p-5 flex flex-col gap-4 border-r border-gray-700 overflow-y-auto">
+
+            <!-- Input de URL / Búsqueda -->
+            <div class="bg-gray-800 p-4 rounded-xl shadow">
+                <label class="block text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">
+                    Añadir canción, búsqueda o URL
+                </label>
+                <div class="flex gap-2">
+                    <input type="text" id="urlInput"
+                        class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm
+                               focus:outline-none focus:border-blue-500 transition placeholder-gray-500"
+                        placeholder="Ej: Shakira Waka Waka · youtube.com/watch?v=...">
+                    <button onclick="addSingle()" id="btnAdd"
+                        style="-webkit-app-region: no-drag"
+                        class="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 px-4 py-2 rounded-lg text-sm font-medium transition">
+                        + Añadir
+                    </button>
+                </div>
+                <p class="text-xs text-gray-600 mt-2">
+                    Texto libre → búsqueda en YouTube. URLs de playlist → te preguntará si descargar toda la lista.
+                </p>
+            </div>
+
+            <!-- Importar .txt -->
+            <div class="bg-gray-800 p-4 rounded-xl shadow">
+                <label class="block text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">
+                    Importar lista (.txt)
+                </label>
+                <input type="file" id="fileInput" accept=".txt"
+                    style="-webkit-app-region: no-drag"
+                    class="block w-full text-xs text-gray-400
+                           file:mr-3 file:py-1.5 file:px-4 file:rounded-full file:border-0
+                           file:text-xs file:font-semibold file:bg-blue-600 file:text-white
+                           hover:file:bg-blue-700 transition cursor-pointer"/>
+                <p class="text-xs text-gray-600 mt-1">Una URL o nombre por línea.</p>
+            </div>
+
+            <!-- Consola de logs -->
+            <div class="flex-1 bg-black rounded-xl border border-gray-700 shadow-inner
+                        flex flex-col relative overflow-hidden min-h-[140px]">
+                <div class="flex items-center justify-between px-3 pt-2 pb-1 border-b border-gray-800">
+                    <span class="text-xs text-gray-600 font-mono uppercase tracking-widest">Consola</span>
+                    <button onclick="clearConsole()"
+                        style="-webkit-app-region: no-drag"
+                        class="text-gray-600 hover:text-gray-300 text-xs transition" title="Limpiar">
+                        🗑
+                    </button>
+                </div>
+                <div class="overflow-y-auto p-3 flex-1 console-text">
+                    <div id="consoleOutput" class="text-xs space-y-0.5">
+                        <div class="text-gray-500">> Sistema listo.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Botones principales: Iniciar y Detener -->
+            <div class="grid grid-cols-2 gap-3" style="-webkit-app-region: no-drag">
+                <button onclick="startDownload()" id="btnStart" disabled
+                    class="bg-green-600 hover:bg-green-700 active:bg-green-800
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           py-3 rounded-xl font-bold shadow-lg transition flex justify-center items-center gap-2">
+                    ▶ Iniciar Descarga
+                </button>
+                <button onclick="stopDownload()" id="btnStop" disabled
+                    class="bg-red-600 hover:bg-red-700 active:bg-red-800
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           py-3 rounded-xl font-bold shadow-lg transition">
+                    ⏹ Detener
+                </button>
+            </div>
+
+            <!-- Botones secundarios: Limpiar y Abrir Carpeta -->
+            <div class="grid grid-cols-2 gap-3" style="-webkit-app-region: no-drag">
+                <button onclick="clearQueue()" id="btnClear"
+                    class="bg-gray-700 hover:bg-gray-600 active:bg-gray-800
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           py-2 rounded-xl text-sm font-medium transition">
+                    🗑 Limpiar Cola
+                </button>
+                <button onclick="openFolder()" id="btnFolder"
+                    class="bg-purple-700 hover:bg-purple-600 active:bg-purple-800
+                           py-2 rounded-xl text-sm font-medium transition flex justify-center items-center gap-2">
+                    📂 Abrir Carpeta
+                </button>
+            </div>
+
+        </section>
+
+        <!-- ── Columna Derecha: Cola de Descargas ── -->
+        <section class="w-1/2 bg-gray-800 p-5 flex flex-col">
+
+            <!-- Cabecera de cola -->
+            <div class="flex justify-between items-center mb-3">
+                <h2 class="text-base font-semibold text-white">Cola de Descargas</h2>
+                <span id="queueCount"
+                    class="bg-blue-900 text-blue-200 text-xs px-2.5 py-0.5 rounded-full font-mono">
+                    0
+                </span>
+            </div>
+
+            <!-- Barra de progreso (oculta por defecto) -->
+            <div id="progressContainer" class="mb-4 bg-gray-700 rounded-xl p-3 hidden">
+                <div class="flex justify-between text-xs text-gray-300 mb-1.5">
+                    <span id="currentFile" class="truncate flex-1 mr-2">Descargando...</span>
+                    <span id="percent" class="shrink-0 font-mono">0%</span>
+                </div>
+                <div class="w-full bg-gray-900 rounded-full h-2">
+                    <div id="progressBar"
+                        class="bg-gradient-to-r from-blue-500 to-cyan-400 h-2 rounded-full transition-all duration-300"
+                        style="width: 0%">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Lista de la cola -->
+            <div id="queueList" class="flex-1 overflow-y-auto space-y-2 pr-1">
+                <div class="text-gray-500 text-center mt-12 italic text-sm">
+                    La cola está vacía
+                </div>
+            </div>
+
+        </section>
+    </main>
+
+    <!--
+      Cargamos el módulo renderer DESPUÉS del DOM para que DOMContentLoaded
+      encuentre todos los elementos. El <script> es el puente entre el HTML
+      y la lógica de src/renderer/index.js compilada/copiada aquí.
+    -->
+    <script src="../src/renderer/index.js"></script>
+
+</body>
+</html>

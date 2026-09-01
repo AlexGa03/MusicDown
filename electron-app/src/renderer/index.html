@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Content-Security-Policy estricto: bloquea inyecciones XSS, restringe scripts y conexiones de red -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; script-src 'self' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; font-src 'self'; object-src 'none'; base-uri 'self';">
+    <title>MusicDown</title>
+    <!-- Tailwind CDN Play (requiere acceso a internet solo la primera vez) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Scrollbar personalizada */
+        ::-webkit-scrollbar       { width: 6px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+
+        /* Fuente monospace para la consola */
+        #log-panel { font-family: 'Courier New', Courier, monospace; }
+
+        /* Colores de log */
+        .log-info    { color: #d1d5db; }
+        .log-success { color: #4ade80; }
+        .log-error   { color: #f87171; }
+        .log-warn    { color: #facc15; }
+        .log-progress{ color: #93c5fd; }
+
+        /* Colores de estado de cola */
+        .item-pending  { background: rgba(75,85,99,0.5); }
+        .item-active   { background: rgba(30,58,138,0.4); border: 1px solid rgba(59,130,246,0.5); }
+        .item-done     { background: rgba(6,78,59,0.3);  border: 1px solid rgba(16,185,129,0.3); }
+        .item-error    { background: rgba(127,29,29,0.3);border: 1px solid rgba(239,68,68,0.3); }
+
+        /* Draggable header */
+        .drag-region { -webkit-app-region: drag; }
+        .no-drag     { -webkit-app-region: no-drag; }
+    </style>
+</head>
+<body class="bg-gray-900 text-white h-screen flex flex-col overflow-hidden">
+
+    <!-- ── CABECERA ─────────────────────────────────────────────────────── -->
+    <header class="drag-region bg-gray-800 px-5 py-3 shadow-lg flex items-center justify-between shrink-0">
+        <div class="flex items-center gap-3 no-drag">
+            <h1 class="text-lg font-bold bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">
+                🎵 MusicDown
+            </h1>
+        </div>
+        <div id="status-indicator" class="text-xs text-gray-500 font-mono no-drag">
+            Iniciando...
+        </div>
+    </header>
+
+    <!-- ── CONTENIDO PRINCIPAL ───────────────────────────────────────────── -->
+    <main class="flex-1 flex overflow-hidden">
+
+        <!-- ──── Columna Izquierda: Controles y Consola ──── -->
+        <section class="w-1/2 flex flex-col gap-3 p-4 border-r border-gray-700 overflow-y-auto">
+
+            <!-- Input de URL / búsqueda de texto -->
+            <div class="bg-gray-800 p-4 rounded-xl shadow">
+                <label class="block text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wider">
+                    Añadir canción, búsqueda o URL
+                </label>
+                <div class="flex gap-2">
+                    <input
+                        type="text"
+                        id="input-url"
+                        class="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-sm
+                               focus:outline-none focus:border-blue-500 transition placeholder-gray-500"
+                        placeholder="Ej: Shakira Waka Waka  ·  youtube.com/watch?v=...">
+                    <button
+                        id="btn-add"
+                        class="no-drag bg-blue-600 hover:bg-blue-700 active:bg-blue-800
+                               px-4 py-2 rounded-lg text-sm font-medium transition cursor-pointer">
+                        + Añadir
+                    </button>
+                </div>
+                <p class="text-xs text-gray-600 mt-1.5">
+                    Texto libre → búsqueda en YouTube. URL con <code>list=</code> → te preguntará si descargar toda la playlist.
+                </p>
+            </div>
+
+            <!-- Importar lista .txt -->
+            <div class="bg-gray-800 p-4 rounded-xl shadow">
+                <label class="block text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wider">
+                    Importar lista (.txt) — una URL o búsqueda por línea
+                </label>
+                <input
+                    type="file"
+                    id="input-file"
+                    accept=".txt"
+                    class="no-drag block w-full text-xs text-gray-400 cursor-pointer
+                           file:mr-3 file:py-1.5 file:px-4 file:rounded-full file:border-0
+                           file:text-xs file:font-semibold file:bg-blue-700 file:text-white
+                           hover:file:bg-blue-600 transition"/>
+            </div>
+
+            <!-- Panel de logs / consola -->
+            <div class="flex-1 bg-black rounded-xl border border-gray-700 flex flex-col min-h-[150px] overflow-hidden">
+                <div class="flex items-center justify-between px-3 py-1.5 border-b border-gray-800 shrink-0">
+                    <span class="text-xs text-gray-600 uppercase tracking-widest">Consola</span>
+                    <button
+                        id="btn-clear-console"
+                        class="no-drag text-gray-600 hover:text-gray-300 text-xs px-2 py-0.5 rounded
+                               hover:bg-gray-800 transition cursor-pointer"
+                        title="Limpiar consola">
+                        🗑 Limpiar
+                    </button>
+                </div>
+                <div class="flex-1 overflow-y-auto p-3">
+                    <div id="log-panel" class="text-xs space-y-0.5">
+                        <div class="log-info">&gt; Sistema iniciando...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Botones principales: Iniciar / Detener -->
+            <div class="grid grid-cols-2 gap-3">
+                <button
+                    id="btn-start"
+                    disabled
+                    class="no-drag bg-green-700 hover:bg-green-600 active:bg-green-800
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           py-3 rounded-xl font-bold text-sm shadow-lg transition cursor-pointer">
+                    ▶ Iniciar Descarga
+                </button>
+                <button
+                    id="btn-stop"
+                    disabled
+                    class="no-drag bg-red-700 hover:bg-red-600 active:bg-red-800
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           py-3 rounded-xl font-bold text-sm shadow-lg transition cursor-pointer">
+                    ⏹ Detener
+                </button>
+            </div>
+
+            <!-- Botones secundarios: Limpiar Cola / Abrir Carpeta -->
+            <div class="grid grid-cols-2 gap-3">
+                <button
+                    id="btn-clear"
+                    class="no-drag bg-gray-700 hover:bg-gray-600 active:bg-gray-800
+                           disabled:opacity-40 disabled:cursor-not-allowed
+                           py-2 rounded-xl text-sm transition cursor-pointer">
+                    🗑 Limpiar Cola
+                </button>
+                <button
+                    id="btn-folder"
+                    class="no-drag bg-purple-700 hover:bg-purple-600 active:bg-purple-800
+                           py-2 rounded-xl text-sm font-medium transition flex justify-center
+                           items-center gap-2 cursor-pointer">
+                    📂 Abrir Carpeta
+                </button>
+            </div>
+
+        </section>
+
+        <!-- ──── Columna Derecha: Cola de Descargas ──── -->
+        <section class="w-1/2 bg-gray-800 flex flex-col p-4">
+
+            <!-- Cabecera de la cola -->
+            <div class="flex justify-between items-center mb-3 shrink-0">
+                <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+                    Cola de Descargas
+                </h2>
+                <span id="queue-count"
+                    class="bg-blue-900 text-blue-200 text-xs px-2.5 py-0.5 rounded-full font-mono min-w-[28px] text-center">
+                    0
+                </span>
+            </div>
+
+            <!-- Barra de progreso de la descarga activa (oculta por defecto) -->
+            <div id="progress-container" class="mb-3 bg-gray-700 rounded-xl p-3 hidden shrink-0">
+                <div class="flex justify-between text-xs text-gray-300 mb-1.5">
+                    <span id="progress-title" class="truncate flex-1 mr-2">Descargando...</span>
+                    <span id="progress-percent" class="shrink-0 font-mono">0%</span>
+                </div>
+                <div class="w-full bg-gray-900 rounded-full h-2">
+                    <div id="progress-bar"
+                        class="bg-gradient-to-r from-blue-500 to-cyan-400 h-2 rounded-full
+                               transition-all duration-300 ease-out"
+                        style="width: 0%">
+                    </div>
+                </div>
+                <div id="progress-meta" class="text-xs text-gray-500 mt-1 font-mono"></div>
+            </div>
+
+            <!-- Lista de items de la cola -->
+            <div id="queue-list" class="flex-1 overflow-y-auto space-y-2 pr-1">
+                <div class="text-gray-500 text-center mt-12 text-sm italic">
+                    La cola está vacía
+                </div>
+            </div>
+
+        </section>
+    </main>
+
+    <!--
+      IMPORTANTE: El script se carga al FINAL del <body> para garantizar que
+      el DOM esté completamente parseado antes de que se ejecute.
+      Ruta relativa: mismo directorio que este HTML → "./index.js"
+    -->
+    <script src="./index.js"></script>
+
+</body>
+</html>

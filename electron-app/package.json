@@ -1,0 +1,63 @@
+{
+  "name": "musicdown",
+  "version": "2.0.0",
+  "description": "YouTube Music Downloader — Electron + yt-dlp standalone",
+  "main": "src/main/main.js",
+  "author": "MusicDown Maintainers",
+  "scripts": {
+    "start":       "electron .",
+    "build:linux": "electron-builder --linux AppImage",
+    "build:win":   "electron-builder --win nsis",
+    "build:all":   "electron-builder --linux AppImage --win nsis"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron":         "^28.3.3",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId":       "com.musicdown.app",
+    "productName": "MusicDown",
+    "copyright":   "Copyright © 2025 MusicDown Project",
+    "directories": {
+      "buildResources": "assets",
+      "output":         "release"
+    },
+
+    "files": [
+      "src/**/*",
+      "package.json",
+      "assets/**/*"
+    ],
+
+    "extraFiles": [
+      {
+        "from": "backend/bin/ffmpeg",
+        "to":   "backend/bin/ffmpeg"
+      },
+      {
+        "from":   "backend/bin/ffmpeg.exe",
+        "to":     "backend/bin/ffmpeg.exe",
+        "filter": ["**/*"]
+      }
+    ],
+
+    "linux": {
+      "target":   [{ "target": "AppImage", "arch": ["x64"] }],
+      "category": "AudioVideo",
+      "icon":     "assets/logo.png"
+    },
+
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon":   "assets/logo.png"
+    },
+
+    "nsis": {
+      "oneClick":                          false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut":             true,
+      "createStartMenuShortcut":           true
+    }
+  }
+}
