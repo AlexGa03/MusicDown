@@ -19,7 +19,7 @@ const path             = require('path');
 const https            = require('https');
 const os               = require('os');
 const { execFileSync, execFile } = require('child_process');
-
+const { app } = require('electron');
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
 const IS_WIN      = process.platform === 'win32';
@@ -54,7 +54,22 @@ let _ffmpegPath = null;
 let _outputDir  = null;
 
 // ─── Helpers de Seguridad y Sanitización ─────────────────────────────────────
+function getYtDlpPath() {
+  const localUserBin = path.join(app.getPath('userData'), 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+  
+  // 1. Si existe en userData, usarlo
+  if (fs.existsSync(localUserBin)) {
+    return localUserBin;
+  }
+  
+  // 2. Fallback para contenedores Docker o sistemas con yt-dlp global
+  const systemBin = '/usr/local/bin/yt-dlp';
+  if (fs.existsSync(systemBin)) {
+    return systemBin;
+  }
 
+  return localUserBin;
+}
 /**
  * Valida que una URL use HTTPS y provenga de un dominio oficial de GitHub.
  * @param {string} urlString

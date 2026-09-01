@@ -22,7 +22,7 @@ FROM node:20-bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:0
 
-# Instalar conjunto completo de librerías nativas requeridas por Chromium/Electron en Debian
+# Instalar dependencias completas + python3 + curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     x11vnc \
@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     websockify \
     fluxbox \
     ffmpeg \
+    python3 \
+    python3-minimal \
     ca-certificates \
     curl \
     libgtk-3-0 \
@@ -49,6 +51,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-descargar yt-dlp globalmente en la imagen
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app/electron-app
 
