@@ -9,8 +9,8 @@ const fs               = require('fs');
 const path             = require('path');
 const https            = require('https');
 const os               = require('os');
-const { execFileSync, execFile } = require('child_process');
-const { BrowserWindow } = require('electron');
+const { execFileSync, execFile, execSync } = require('child_process');
+const { app, BrowserWindow } = require('electron');
 
 // ─── Constantes del Sistema ───────────────────────────────────────────────────
 
@@ -59,6 +59,7 @@ let _binaryPath = null;
 let _ffmpegPath = null;
 let _outputDir  = null;
 let _initPromise = null;
+let cachedYtDlpPath = null;
 
 // ─── Notificaciones de Estado IPC ─────────────────────────────────────────────
 
@@ -75,7 +76,7 @@ function broadcastStatus(status, message, extra = {}) {
   const payload = {
     status: _status,
     message: _statusMessage,
-    binaryPath: _binaryPath || (typeof app !== 'undefined' ? getYtDlpPath(app) : null),
+    binaryPath: _binaryPath || getYtDlpPath(),
     ffmpegPath: _ffmpegPath,
     outputDir: _outputDir,
     isReady: _status === 'READY',
@@ -98,66 +99,89 @@ function broadcastStatus(status, message, extra = {}) {
 // ─── Resolución de Rutas de Binarios ──────────────────────────────────────────
 
 /**
- * Resuelve la ruta esperada de yt-dlp.
+ * Resuelve la ruta esperada de yt-dlp de forma dinámica y resiliente.
  * IMPORTANTE: NUNCA devuelve null.
- * @param {Electron.App} appInstance
+ * @param {Electron.App} [appInstance]
  * @returns {string} Ruta absoluta del binario (instalado o esperado).
  */
 function getYtDlpPath(appInstance) {
-  // 1. Si ya se resolvió y validó en memoria, retornarlo
+  if (cachedYtDlpPath && fs.existsSync(cachedYtDlpPath)) {
+    return cachedYtDlpPath;
+  }
+
   if (_binaryPath && fs.existsSync(_binaryPath)) {
+    cachedYtDlpPath = _binaryPath;
     return _binaryPath;
   }
 
-  // 2. Ruta local estándar en el directorio de datos del usuario (userData/bin/)
-  let localUserBin = '';
-  if (appInstance && typeof appInstance.getPath === 'function') {
-    localUserBin = path.normalize(path.join(appInstance.getPath('userData'), 'bin', BIN_NAME));
-  } else {
-    localUserBin = path.normalize(path.join(os.homedir(), '.config', 'musicdown', 'bin', BIN_NAME));
+  const isWin = process.platform === 'win32';
+  const binaryName = isWin ? 'yt-dlp.exe' : 'yt-dlp';
+
+  let userBin = '';
+  try {
+    const electronApp = appInstance || app;
+    if (electronApp && typeof electronApp.getPath === 'function') {
+      userBin = path.normalize(path.join(electronApp.getPath('userData'), 'bin', binaryName));
+    } else {
+      userBin = path.normalize(path.join(os.homedir(), '.config', 'musicdown', 'bin', binaryName));
+    }
+  } catch (_) {
+    userBin = path.normalize(path.join(os.homedir(), '.config', 'musicdown', 'bin', binaryName));
   }
 
-  if (fs.existsSync(localUserBin)) {
-    return localUserBin;
+  // 1. Binario local del usuario (AppImage / Instalador)
+  if (fs.existsSync(userBin)) {
+    try {
+      fs.accessSync(userBin, fs.constants.X_OK);
+      cachedYtDlpPath = userBin;
+      _binaryPath = userBin;
+      return userBin;
+    } catch (_) {}
   }
 
-  // 3. Fallbacks en Linux / Docker (instalación global vía pip3 o apt)
-  if (!IS_WIN) {
-    const globalFallbacks = [
+  // 2. Rutas estándar globales (Docker / Linux Host)
+  if (!isWin) {
+    const candidatePaths = [
       '/usr/local/bin/yt-dlp',
       '/usr/bin/yt-dlp',
-      '/opt/homebrew/bin/yt-dlp',
+      '/root/.local/bin/yt-dlp',
+      path.join(process.env.HOME || '/root', '.local/bin/yt-dlp')
     ];
 
-    for (const sysPath of globalFallbacks) {
-      if (fs.existsSync(sysPath)) {
-        return sysPath;
+    for (const p of candidatePaths) {
+      if (fs.existsSync(p)) {
+        try {
+          fs.accessSync(p, fs.constants.X_OK);
+          cachedYtDlpPath = p;
+          _binaryPath = p;
+          return p;
+        } catch (_) {}
       }
     }
 
+    // 3. Consulta dinámica al entorno ($PATH)
     try {
-      const whichResult = execFileSync('which', ['yt-dlp'], { encoding: 'utf8', windowsHide: true }).trim();
-      if (whichResult && fs.existsSync(whichResult)) {
-        return whichResult;
+      const resolved = execSync('which yt-dlp', { encoding: 'utf8' }).trim();
+      if (resolved && fs.existsSync(resolved)) {
+        cachedYtDlpPath = resolved;
+        _binaryPath = resolved;
+        return resolved;
       }
-    } catch {
-      // No presente en PATH global
-    }
+    } catch (_) {}
   } else {
-    // Fallback PATH en Windows (where yt-dlp)
+    // Windows: where yt-dlp.exe
     try {
-      const whereResult = execFileSync('where', ['yt-dlp.exe'], { encoding: 'utf8', windowsHide: true })
-        .trim().split(/\r?\n/)[0].trim();
+      const whereResult = execSync('where yt-dlp.exe', { encoding: 'utf8' }).trim().split(/\r?\n/)[0].trim();
       if (whereResult && fs.existsSync(whereResult)) {
+        cachedYtDlpPath = whereResult;
+        _binaryPath = whereResult;
         return whereResult;
       }
-    } catch {
-      // No presente en PATH de Windows
-    }
+    } catch (_) {}
   }
 
-  // Si aún no existe en disco, se retorna la ruta destino donde se descargará
-  return localUserBin;
+  // Fallback final: devolver userBin en lugar de null para evitar rotura de tipos
+  return userBin;
 }
 
 /**
@@ -544,54 +568,11 @@ async function ensureYtDlp(appInstance) {
 
 // ─── Exportaciones Públicas ───────────────────────────────────────────────────
 
-/**
- * Devuelve la ruta al binario yt-dlp ya resuelto y validado.
- *
- * Prioridad:
- *   1. _binaryPath (seteado por ensureYtDlp() tras descarga o validación exitosa)
- *   2. Fallbacks del sistema (pip3: /usr/local/bin/yt-dlp, /usr/bin/yt-dlp, etc.)
- *   3. null si no hay binario disponible
- *
- * NUNCA usa la ruta de userData como "ruta resuelta" si el archivo no existe ahí.
- * @returns {string|null}
- */
-function getBinaryPathResolved() {
-  // 1. Ruta ya validada en memoria (asignada por ensureYtDlp)
-  if (_binaryPath && fs.existsSync(_binaryPath)) {
-    return _binaryPath;
-  }
-
-  // 2. Fallbacks de sistema (Linux/Docker: pip3, apt; macOS: brew)
-  if (!IS_WIN) {
-    const globalFallbacks = [
-      '/usr/local/bin/yt-dlp',
-      '/usr/bin/yt-dlp',
-      '/opt/homebrew/bin/yt-dlp',
-    ];
-    for (const p of globalFallbacks) {
-      if (fs.existsSync(p)) return p;
-    }
-    try {
-      const w = execFileSync('which', ['yt-dlp'], { encoding: 'utf8', windowsHide: true }).trim();
-      if (w && fs.existsSync(w)) return w;
-    } catch {}
-  } else {
-    try {
-      const w = execFileSync('where', ['yt-dlp.exe'], { encoding: 'utf8', windowsHide: true })
-        .trim().split(/\r?\n/)[0].trim();
-      if (w && fs.existsSync(w)) return w;
-    } catch {}
-  }
-
-  // 3. No disponible
-  return null;
-}
-
 module.exports = {
   initYtDlp: ensureYtDlp,
   ensureYtDlp,
   getYtDlpPath,
-  getBinaryPath: getBinaryPathResolved,
+  getBinaryPath: getYtDlpPath,
   getFfmpegPath: () => _ffmpegPath,
   getOutputDir:  () => _outputDir,
   getYtDlpStatus: () => _status,

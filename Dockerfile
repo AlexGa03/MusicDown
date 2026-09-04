@@ -93,8 +93,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# 2. Instalar yt-dlp globalmente en el sistema con pip3 (ubicado en /usr/local/bin/yt-dlp)
+# 2. Instalación limpia vía pip y aseguramiento de enlaces simbólicos en $PATH
 RUN pip3 install --no-cache-dir --break-system-packages yt-dlp \
+    && ln -sf $(which yt-dlp || echo /usr/local/bin/yt-dlp) /usr/local/bin/yt-dlp \
+    && ln -sf /usr/local/bin/yt-dlp /usr/bin/yt-dlp \
     && chmod a+rx /usr/local/bin/yt-dlp \
     && yt-dlp --version \
     && ffmpeg -version | head -n 1

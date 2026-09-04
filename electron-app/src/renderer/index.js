@@ -679,8 +679,8 @@ async function bootstrap() {
 
       appendLog(
         binOk
-          ? 'yt-dlp: Motor de descargas listo.'
-          : '⚠️ yt-dlp no disponible. Se intentará descargar automáticamente.',
+          ? `yt-dlp: Motor de descargas listo (${status.binaryPath}).`
+          : `⚠️ yt-dlp no disponible. Ruta: '${status.binaryPath || 'ninguna'}'. Se intentará descargar automáticamente.`,
         binOk ? 'success' : 'warn'
       );
 

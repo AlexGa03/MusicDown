@@ -167,7 +167,7 @@ function runDownload(wc, item, index, total, opts = {}) {
     //   3. /usr/bin/yt-dlp (apt)
     //   4. which/where en PATH
     //   5. null si no hay binario disponible
-    const binary = getBinaryPath();
+    const binary = getYtDlpPath();
 
     console.log(`[IPC RECEIVED] runDownload | item ${index + 1}/${total}: ${item.url}`);
     console.log(`[BINARY CHECK] Ruta efectiva de yt-dlp: ${binary ?? '(no disponible)'}`);
@@ -189,7 +189,7 @@ function runDownload(wc, item, index, total, opts = {}) {
 
     console.log('[SPAWN COMMAND]:', binary);
     console.log('[SPAWN COMMAND] args:', args.join(' '));
-    log(wc, `Iniciando: ${item.title}`, 'info');
+    log(wc, `Iniciando: ${item.title} (yt-dlp: ${binary})`, 'info');
 
     let child;
     try {
