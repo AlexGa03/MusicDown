@@ -193,6 +193,14 @@ function isAllowedUrl(urlString) {
 
 /**
  * Descarga un archivo por HTTPS con redirecciones seguras y escritura atómica.
+ *
+ * Protocolo de escritura atómica (garantía anti-race-condition en Windows):
+ *   1. Escribe el contenido en <dest>.tmp
+ *   2. Espera el evento 'finish' del WriteStream y cierra el descriptor
+ *   3. Verifica que el .tmp tenga tamaño > MIN_SIZE (descarta páginas de error HTML)
+ *   4. Elimina <dest> si existía y renombra .tmp → dest atómicamente con renameSync
+ *   5. Solo entonces la promesa resuelve, desbloqueando _initPromise
+ *
  * @param {string} url
  * @param {string} dest
  * @param {number} [hop=0]
@@ -208,6 +216,9 @@ function downloadFile(url, dest, hop = 0) {
     if (!fs.existsSync(parentDir)) {
       fs.mkdirSync(parentDir, { recursive: true });
     }
+
+    // Eliminar cualquier .tmp residual de una descarga anterior interrumpida
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
 
     const req = https.get(url, { timeout: 60_000 }, (res) => {
       const { statusCode, headers } = res;
@@ -233,29 +244,55 @@ function downloadFile(url, dest, hop = 0) {
       const out = fs.createWriteStream(tmp);
       res.pipe(out);
 
+      // ── Escritura Atómica con Validación de Tamaño ────────────────────────
       out.on('finish', () => {
-        out.close(() => {
+        // out.close() garantiza que el descriptor del archivo está cerrado
+        // y todos los bytes han sido escritos en disco antes de renombrar.
+        out.close((closeErr) => {
+          if (closeErr) {
+            try { fs.unlinkSync(tmp); } catch {}
+            return reject(new Error(`Error al cerrar descriptor de archivo .tmp: ${closeErr.message}`));
+          }
+
+          // Validación de tamaño mínimo sobre el .tmp (antes de renombrar)
+          // Esto protege contra páginas de error HTML descargadas por redirecciones
+          // no detectadas o respuestas de rate-limiting que devuelvan 200 con HTML.
+          let tmpSize = 0;
           try {
-            if (fs.existsSync(dest)) {
-              fs.unlinkSync(dest);
-            }
+            tmpSize = fs.statSync(tmp).size;
+          } catch (statErr) {
+            return reject(new Error(`No se pudo leer el tamaño del archivo .tmp: ${statErr.message}`));
+          }
+
+          if (tmpSize < MIN_SIZE) {
+            try { fs.unlinkSync(tmp); } catch {}
+            return reject(new Error(
+              `Descarga corrupta o incompleta: el archivo .tmp tiene solo ${tmpSize} bytes ` +
+              `(mínimo requerido: ${MIN_SIZE} bytes). ` +
+              `Puede ser una página de error HTML o una descarga interrumpida.`
+            ));
+          }
+
+          // Rename atómico: reemplaza el destino solo cuando .tmp es válido
+          try {
+            if (fs.existsSync(dest)) fs.unlinkSync(dest);
             fs.renameSync(tmp, dest);
             resolve();
-          } catch (err) {
+          } catch (renameErr) {
             try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
-            reject(err);
+            reject(new Error(`Error al renombrar .tmp → destino: ${renameErr.message}`));
           }
         });
       });
 
       out.on('error', (e) => {
         try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
-        reject(e);
+        reject(new Error(`Error de escritura en disco: ${e.message}`));
       });
 
       res.on('error', (e) => {
         try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
-        reject(e);
+        reject(new Error(`Error de transferencia HTTP: ${e.message}`));
       });
     });
 

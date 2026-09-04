@@ -1,33 +1,32 @@
 # ==============================================================================
 # Multi-Stage Dockerfile for MusicDown (Electron + Web GUI via noVNC)
 # Base Image: Debian Bookworm (node:20-bookworm-slim)
+#
+# Stage 1 (builder): instala dependencias Node de electron-app/ con npm install.
+# Stage 2 (runtime): entorno headless X11 + Fluxbox + noVNC + yt-dlp + ffmpeg.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
 # Stage 1: Builder
+# Nota: se usa npm install (no npm ci) para tolerar lockfiles desincronizados
+# entre entornos de desarrollo y CI sin bloquear el build de Docker.
+# No existe ningún subdirectorio frontend/ independiente en este proyecto.
 # ------------------------------------------------------------------------------
 FROM node:20-bookworm-slim AS builder
 
 WORKDIR /app/electron-app
 
-# Copiar manifiestos de dependencias
+# Copiar solo los manifiestos primero para aprovechar la caché de capas Docker:
+# si package.json no cambia, npm install no se vuelve a ejecutar.
 COPY electron-app/package*.json ./
 
-# Copiar manifiestos de frontend subordinado si aplica
-COPY electron-app/frontend/package*.json ./frontend/
-
-# Instalar dependencias limpias para compilación
-RUN npm ci
-
-# Compilar frontend si aplica
-RUN if [ -f "./frontend/package.json" ]; then \
-        cd frontend && npm ci && npm run build && cd ..; \
-    fi
+# Instalar todas las dependencias (producción + devDependencies para electron-builder)
+RUN npm install --prefer-offline --no-audit --no-fund
 
 # Copiar el código fuente completo de la aplicación
 COPY electron-app/ .
 
-# Limpieza de caché de npm
+# Limpieza de caché para reducir tamaño de la imagen intermedia
 RUN npm cache clean --force
 
 # ------------------------------------------------------------------------------
@@ -43,6 +42,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RESOLUTION=1280x800x24 \
     ELECTRON_DISABLE_SANDBOX=1 \
     ELECTRON_ENABLE_LOGGING=1 \
+    IS_DOCKER=1 \
     NODE_ENV=production
 
 # 1. Instalar dependencias de sistema:

@@ -106,6 +106,13 @@ function buildArgs(url, opts = {}) {
     '--newline',
     '--no-colors',
     '--progress',
+    // Suprime el warning "No supported Javascript runtime could be found"
+    // que aparece en Linux AppImage donde deno no está disponible.
+    // yt-dlp intentará los runtimes disponibles sin abortar la descarga.
+    '--no-warnings',
+    // Fuerza el cliente de reproductor por defecto de YouTube para evitar
+    // dependencias de runtime JS externo (deno/node) en la resolución de streams.
+    '--extractor-args', 'youtube:player_client=default',
   ];
 
   args.push(downloadAll ? '--yes-playlist' : '--no-playlist');
@@ -459,7 +466,9 @@ function registerHandlers(ipcMain, appInstance) {
     const downloadDir = path.normalize(rawDir);
 
     try {
-      // Verificar y crear físicamente si no existe
+      // ── Crear el directorio explícita y síncronamente antes de openPath ──
+      // shell.openPath falla silenciosamente si el directorio no existe físicamente.
+      // fs.mkdirSync con recursive:true es idempotente y no lanza si ya existe.
       if (!fs.existsSync(downloadDir)) {
         fs.mkdirSync(downloadDir, { recursive: true });
         console.log(`[ipc] Carpeta creada previamente a la apertura: ${downloadDir}`);
@@ -467,17 +476,35 @@ function registerHandlers(ipcMain, appInstance) {
 
       const openResult = await shell.openPath(downloadDir);
       if (openResult) {
-        const errorMsg = `No se pudo abrir carpeta: ${openResult}`;
-        console.error(`[ipc] ${errorMsg}`);
-        log(event.sender, errorMsg, 'error');
-        return { opened: false, error: openResult };
+        // shell.openPath devuelve un string con el mensaje de error si falla.
+        throw new Error(openResult);
       }
 
       log(event.sender, `Carpeta abierta en el explorador: ${downloadDir}`, 'info');
+
+      // ── Reset de foco para Linux/Wayland (Hyprland, Sway, GNOME, KDE) ─────
+      // Al abrir el gestor de archivos externo en Wayland, el compositor puede
+      // quedar con el foco "partido": el cursor se atasca en un puntero de selección
+      // y no responde a clics en la ventana de Electron.
+      // Solución: blur() + focus() con un pequeño delay fuerza al compositor a
+      // devolver el foco correctamente a la ventana de Electron.
+      if (process.platform === 'linux') {
+        const allWindows = require('electron').BrowserWindow.getAllWindows();
+        const win = allWindows.find(w => !w.isDestroyed() && w.isVisible()) || allWindows[0];
+        if (win && !win.isDestroyed()) {
+          setTimeout(() => {
+            try {
+              win.blur();
+              win.focus();
+            } catch {}
+          }, 300);
+        }
+      }
+
       return { opened: true, dir: downloadDir };
 
     } catch (err) {
-      const errorMsg = `Error al abrir directorio de descargas: ${err.message}`;
+      const errorMsg = `No se pudo abrir carpeta: ${err.message}`;
       console.error(`[ipc] ${errorMsg}`);
       log(event.sender, errorMsg, 'error');
       return { opened: false, error: err.message };
