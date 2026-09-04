@@ -4,70 +4,117 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Stage 1: Build de dependencias
+# Stage 1: Builder
+# ------------------------------------------------------------------------------
 FROM node:20-bookworm-slim AS builder
 
-WORKDIR /app
-
-COPY electron-app/package*.json ./electron-app/
 WORKDIR /app/electron-app
-RUN npm install
 
-COPY electron-app/ ./
-RUN npm run build --if-present
+# Copiar manifiestos de dependencias
+COPY electron-app/package*.json ./
 
-# Stage 2: Runtime con X11 Virtual y NoVNC (Web GUI)
-FROM node:20-bookworm-slim
+# Copiar manifiestos de frontend subordinado si aplica
+COPY electron-app/frontend/package*.json ./frontend/
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV DISPLAY=:0
+# Instalar dependencias limpias para compilación
+RUN npm ci
 
-# Instalar dependencias completas + python3 + curl
+# Compilar frontend si aplica
+RUN if [ -f "./frontend/package.json" ]; then \
+        cd frontend && npm ci && npm run build && cd ..; \
+    fi
+
+# Copiar el código fuente completo de la aplicación
+COPY electron-app/ .
+
+# Limpieza de caché de npm
+RUN npm cache clean --force
+
+# ------------------------------------------------------------------------------
+# Stage 2: Runtime Web GUI (Headless X11 + Fluxbox + noVNC + Electron)
+# ------------------------------------------------------------------------------
+FROM node:20-bookworm-slim AS runtime
+
+LABEL maintainer="MusicDown DevOps Team"
+LABEL description="Containerized MusicDown Electron Desktop App accessible via Web Browser (noVNC)"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DISPLAY=:0 \
+    RESOLUTION=1280x800x24 \
+    ELECTRON_DISABLE_SANDBOX=1 \
+    ELECTRON_ENABLE_LOGGING=1 \
+    NODE_ENV=production
+
+# 1. Instalar dependencias de sistema:
+# - Servidor X virtual y gestor de ventanas: xvfb, fluxbox, x11vnc, xauth, dbus-x11
+# - Servidor Web / Proxy VNC: novnc, websockify
+# - Procesamiento multimedia y utilidades: ffmpeg, ca-certificates, curl, wget, procps
+# - Python3 y pip para gestión oficial de yt-dlp
+# - Librerías compartidas de Chromium/Electron: GTK-3, NSS, ASOUND, ATK, GBM, etc.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
+    fluxbox \
     x11vnc \
     novnc \
     websockify \
-    fluxbox \
     ffmpeg \
     python3 \
-    python3-minimal \
+    python3-pip \
+    python3-venv \
     ca-certificates \
     curl \
+    wget \
+    procps \
+    xauth \
+    x11-xserver-utils \
+    dbus-x11 \
     libgtk-3-0 \
+    libnotify4 \
     libnss3 \
     libxss1 \
     libasound2 \
-    libatk1.0-0 \
     libatk-bridge2.0-0 \
+    libatk1.0-0 \
     libcups2 \
     libdrm2 \
-    libxkbcommon0 \
+    libgbm1 \
+    libsecret-1-0 \
     libxcomposite1 \
     libxdamage1 \
     libxfixes3 \
     libxrandr2 \
-    libgbm1 \
+    libxtst6 \
     libpango-1.0-0 \
     libcairo2 \
-    && rm -rf /var/lib/apt/lists/*
+    libxkbcommon0 \
+    fonts-liberation \
+    fonts-dejavu-core \
+    && ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Pre-descargar yt-dlp globalmente en la imagen
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp
+# 2. Instalar yt-dlp globalmente en el sistema con pip3 (ubicado en /usr/local/bin/yt-dlp)
+RUN pip3 install --no-cache-dir --break-system-packages yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp \
+    && yt-dlp --version \
+    && ffmpeg -version | head -n 1
 
-WORKDIR /app/electron-app
+WORKDIR /app
 
-COPY --from=builder /app/electron-app /app/electron-app
+# Copiar aplicación construida y sus node_modules desde el stage de builder
+COPY --from=builder /app/electron-app ./electron-app
 
-RUN echo '#!/bin/bash\n\
-Xvfb :0 -screen 0 1280x800x24 &\n\
-fluxbox &\n\
-x11vnc -display :0 -nopw -forever -shared &\n\
-websockify --web /usr/share/novnc 8080 localhost:5900 &\n\
-cd /app/electron-app && npm start -- --no-sandbox\n\
-' > /entrypoint.sh && chmod +x /entrypoint.sh
+# Crear directorios para descargas y datos de usuario con permisos adecuados
+RUN mkdir -p /app/downloads /app/userData /root/.config
 
+# Copiar script de inicialización y punto de entrada
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Volumen persistente para almacenar descargas de música
+VOLUME ["/app/downloads"]
+
+# Exponer el puerto HTTP de noVNC (acceso por navegador)
 EXPOSE 8080
 
-CMD ["/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]

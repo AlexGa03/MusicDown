@@ -465,6 +465,26 @@ function initIPCListeners() {
     }
   });
 
+  // Suscripción al estado de yt-dlp en tiempo real
+  if (typeof window.electronAPI.onYtDlpStatus === 'function') {
+    window.electronAPI.onYtDlpStatus(({ status, message, version }) => {
+      console.log(`[RENDERER] onYtDlpStatus: ${status} - ${message}`);
+      const indicator = document.getElementById('status-indicator');
+      if (indicator) {
+        if (status === 'READY') {
+          indicator.textContent = `yt-dlp OK ${version ? 'v' + version : ''}`;
+          indicator.className   = 'text-xs font-mono no-drag text-green-400';
+        } else if (status === 'INITIALIZING') {
+          indicator.textContent = '⏳ Descargando yt-dlp...';
+          indicator.className   = 'text-xs font-mono no-drag text-yellow-400 animate-pulse';
+        } else if (status === 'ERROR') {
+          indicator.textContent = '⚠️ Error yt-dlp';
+          indicator.className   = 'text-xs font-mono no-drag text-red-400';
+        }
+      }
+    });
+  }
+
   console.log('[RENDERER] Suscripciones IPC registradas OK.');
 }
 

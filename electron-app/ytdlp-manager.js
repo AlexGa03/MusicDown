@@ -1,33 +1,33 @@
 'use strict';
 
 /**
- * @file ytdlp-manager.js
- * @description Gestiona el ciclo de vida del binario standalone de yt-dlp.
+ * @file src/main/ytdlp-manager.js
+ * @description Gestor de ciclo de vida, resolución multiplataforma y descarga automática de yt-dlp y ffmpeg.
  *
- * Responsabilidades:
- *   - Descarga del binario desde GitHub Releases si no existe.
- *   - Validación post-descarga: tamaño mínimo + ejecución de --version.
- *   - Verificación y corrección del bit +x en cada arranque (Linux).
- *   - Actualización silenciosa en background (yt-dlp -U).
- *   - Resolución de la ruta de ffmpeg bundleado.
- *   - Resolución del directorio de descarga escribible.
+ * Características principales:
+ *   - Soporte multiplataforma: Windows (yt-dlp.exe sin chmod), Linux/Docker (/usr/local/bin/yt-dlp fallback) y macOS.
+ *   - Manejo de estados IPC: 'INITIALIZING', 'READY', 'ERROR' con notificación en tiempo real a la UI.
+ *   - getYtDlpPath() NUNCA devuelve null.
+ *   - Descarga atómica y segura mediante HTTPS siguiendo redirecciones autorizadas.
+ *   - Validación estricta: tamaño mínimo (>1MB) y prueba de ejecución (--version).
+ *   - Resolución robusta de rutas absolutas para descargas y ffmpeg.
  */
 
-const fs      = require('fs');
-const path    = require('path');
-const https   = require('https');
-const os      = require('os');
+const fs               = require('fs');
+const path             = require('path');
+const https            = require('https');
+const os               = require('os');
 const { execFileSync, execFile } = require('child_process');
+const { BrowserWindow } = require('electron');
 
-// ─── Constantes ───────────────────────────────────────────────────────────────
+// ─── Constantes del Sistema ───────────────────────────────────────────────────
 
-const IS_WINDOWS  = process.platform === 'win32';
-const BINARY_NAME = IS_WINDOWS ? 'yt-dlp.exe' : 'yt-dlp';
-const EXEC_MODE   = 0o755;
-const DIR_MODE    = 0o700;
-const MAX_REDIRECTS = 10;
-/** Tamaño mínimo válido para un binario yt-dlp real (~3 MB). */
-const MIN_BINARY_SIZE = 1_000_000;
+const IS_WIN   = process.platform === 'win32';
+const BIN_NAME = IS_WIN ? 'yt-dlp.exe' : 'yt-dlp';
+const EXEC_MODE = 0o755;
+const DIR_MODE  = 0o700;
+const MIN_SIZE  = 1_000_000; // 1 MB mínimo para binario ejecutable real
+const MAX_HOPS  = 10;
 
 const ALLOWED_DOWNLOAD_DOMAINS = [
   'github.com',
@@ -42,15 +42,138 @@ const DOWNLOAD_URLS = {
   linux:  'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp',
   darwin: 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos',
 };
-const DOWNLOAD_URL = DOWNLOAD_URLS[process.platform] ?? DOWNLOAD_URLS.linux;
 
-// Estado del módulo
-let _resolvedBinaryPath = null;
-let _ffmpegPath         = null;
-let _outputDir          = null;
+const DOWNLOAD_URL = DOWNLOAD_URLS[process.platform] || DOWNLOAD_URLS.linux;
 
-// ─── Helpers de Seguridad y Sanitización ─────────────────────────────────────
+// ─── Estado Global del Módulo ─────────────────────────────────────────────────
 
+/** @type {'IDLE' | 'INITIALIZING' | 'READY' | 'ERROR'} */
+let _status = 'IDLE';
+let _statusMessage = 'No inicializado';
+let _binaryPath = null;
+let _ffmpegPath = null;
+let _outputDir  = null;
+let _initPromise = null;
+
+// ─── Notificaciones de Estado IPC ─────────────────────────────────────────────
+
+/**
+ * Notifica a todas las ventanas abiertas sobre el cambio de estado de yt-dlp.
+ * @param {'INITIALIZING' | 'READY' | 'ERROR'} status
+ * @param {string} message
+ * @param {object} [extra]
+ */
+function broadcastStatus(status, message, extra = {}) {
+  _status = status;
+  _statusMessage = message;
+
+  const payload = {
+    status: _status,
+    message: _statusMessage,
+    binaryPath: _binaryPath || (typeof app !== 'undefined' ? getYtDlpPath(app) : null),
+    ffmpegPath: _ffmpegPath,
+    outputDir: _outputDir,
+    isReady: _status === 'READY',
+    ...extra,
+  };
+
+  const windows = BrowserWindow.getAllWindows();
+  for (const win of windows) {
+    if (!win.isDestroyed()) {
+      win.webContents.send('app:ytdlp-status', payload);
+      win.webContents.send('app:log', {
+        level: status === 'ERROR' ? 'error' : (status === 'READY' ? 'success' : 'info'),
+        msg: `[yt-dlp] [${status}] ${message}`,
+        ts: new Date().toLocaleTimeString('es-ES', { hour12: false }),
+      });
+    }
+  }
+}
+
+// ─── Resolución de Rutas de Binarios ──────────────────────────────────────────
+
+/**
+ * Resuelve la ruta esperada de yt-dlp.
+ * IMPORTANTE: NUNCA devuelve null.
+ * @param {Electron.App} appInstance
+ * @returns {string} Ruta absoluta del binario (instalado o esperado).
+ */
+function getYtDlpPath(appInstance) {
+  // 1. Si ya se resolvió y validó en memoria, retornarlo
+  if (_binaryPath && fs.existsSync(_binaryPath)) {
+    return _binaryPath;
+  }
+
+  // 2. Ruta local estándar en el directorio de datos del usuario (userData/bin/)
+  let localUserBin = '';
+  if (appInstance && typeof appInstance.getPath === 'function') {
+    localUserBin = path.normalize(path.join(appInstance.getPath('userData'), 'bin', BIN_NAME));
+  } else {
+    localUserBin = path.normalize(path.join(os.homedir(), '.config', 'musicdown', 'bin', BIN_NAME));
+  }
+
+  if (fs.existsSync(localUserBin)) {
+    return localUserBin;
+  }
+
+  // 3. Fallbacks en Linux / Docker (instalación global vía pip3 o apt)
+  if (!IS_WIN) {
+    const globalFallbacks = [
+      '/usr/local/bin/yt-dlp',
+      '/usr/bin/yt-dlp',
+      '/opt/homebrew/bin/yt-dlp',
+    ];
+
+    for (const sysPath of globalFallbacks) {
+      if (fs.existsSync(sysPath)) {
+        return sysPath;
+      }
+    }
+
+    try {
+      const whichResult = execFileSync('which', ['yt-dlp'], { encoding: 'utf8', windowsHide: true }).trim();
+      if (whichResult && fs.existsSync(whichResult)) {
+        return whichResult;
+      }
+    } catch {
+      // No existe en PATH global
+    }
+  } else {
+    // Fallback PATH en Windows (where yt-dlp)
+    try {
+      const whereResult = execFileSync('where', ['yt-dlp.exe'], { encoding: 'utf8', windowsHide: true })
+        .trim().split(/\r?\n/)[0].trim();
+      if (whereResult && fs.existsSync(whereResult)) {
+        return whereResult;
+      }
+    } catch {
+      // No existe en PATH de Windows
+    }
+  }
+
+  // Si no existe aún en disco, retornamos la ruta objetivo donde DEBE descargarse
+  return localUserBin;
+}
+
+/**
+ * Sanitiza una ruta para mostrar en logs (reemplaza home por ~).
+ * @param {string|null|undefined} p
+ * @returns {string}
+ */
+function sanitizePath(p) {
+  if (!p || typeof p !== 'string') return '';
+  const home = os.homedir();
+  if (home && p.startsWith(home)) {
+    return '~' + p.slice(home.length);
+  }
+  return p;
+}
+
+/**
+ * Valida URLs autorizadas para descarga.
+ * @param {string} urlString
+ * @returns {boolean}
+ */
 function isAllowedUrl(urlString) {
   try {
     const parsed = new URL(urlString);
@@ -63,311 +186,312 @@ function isAllowedUrl(urlString) {
   }
 }
 
-function sanitizePath(p) {
-  if (!p || typeof p !== 'string') return '';
-  const home = os.homedir();
-  if (home && p.startsWith(home)) {
-    return '~' + p.slice(home.length);
-  }
-  return p;
-}
-
-// ─── Helpers privados ─────────────────────────────────────────────────────────
-
-function _getBinDir(app) {
-  return path.join(app.getPath('userData'), 'bin');
-}
-
 /**
- * Descarga un archivo HTTPS siguiendo redirecciones seguras. Escritura atómica (.tmp → final).
+ * Descarga un archivo por HTTPS con redirecciones seguras.
  * @param {string} url
- * @param {string} destPath
- * @param {number} [hops=0]
+ * @param {string} dest
+ * @param {number} [hop=0]
  * @returns {Promise<void>}
  */
-function _downloadFile(url, destPath, hops = 0) {
+function downloadFile(url, dest, hop = 0) {
   return new Promise((resolve, reject) => {
-    if (hops > MAX_REDIRECTS)
-      return reject(new Error(`[ytdlp-manager] Demasiadas redirecciones (>${MAX_REDIRECTS})`));
-    if (!isAllowedUrl(url))
-      return reject(new Error(`[ytdlp-manager] Dominio no autorizado para descarga: ${url}`));
+    if (hop > MAX_HOPS) return reject(new Error(`Demasiadas redirecciones (>${MAX_HOPS})`));
+    if (!isAllowedUrl(url)) return reject(new Error(`URL o dominio no autorizado para descarga: ${url}`));
 
-    const tmpPath = destPath + '.tmp';
+    const tmp = dest + '.tmp';
 
-    const req = https.get(url, { timeout: 30_000 }, (res) => {
+    // Asegurar directorio destino
+    const parentDir = path.dirname(dest);
+    if (!fs.existsSync(parentDir)) {
+      fs.mkdirSync(parentDir, { recursive: true });
+    }
+
+    const req = https.get(url, { timeout: 60_000 }, (res) => {
       const { statusCode, headers } = res;
 
       if ([301, 302, 307, 308].includes(statusCode)) {
-        const location = headers.location;
-        if (!location) { res.resume(); return reject(new Error(`Redirección ${statusCode} sin Location`)); }
+        if (!headers.location) {
+          res.resume();
+          return reject(new Error(`Redirección ${statusCode} sin cabecera Location`));
+        }
         res.resume();
-        const nextUrl = new URL(location, url).toString();
+        const nextUrl = new URL(headers.location, url).toString();
         if (!isAllowedUrl(nextUrl)) {
           return reject(new Error(`Redirección a dominio no autorizado: ${nextUrl}`));
         }
-        return resolve(_downloadFile(nextUrl, destPath, hops + 1));
+        return resolve(downloadFile(nextUrl, dest, hop + 1));
       }
 
       if (statusCode !== 200) {
         res.resume();
-        return reject(new Error(`[ytdlp-manager] HTTP ${statusCode}`));
+        return reject(new Error(`HTTP ${statusCode} al descargar yt-dlp desde ${url}`));
       }
 
-      const stream = fs.createWriteStream(tmpPath);
-      res.pipe(stream);
+      const out = fs.createWriteStream(tmp);
+      res.pipe(out);
 
-      stream.on('finish', () => {
-        stream.close(() => {
-          fs.rename(tmpPath, destPath, (err) => {
-            if (err) { fs.unlink(tmpPath, () => {}); return reject(err); }
+      out.on('finish', () => {
+        out.close(() => {
+          try {
+            if (fs.existsSync(dest)) {
+              fs.unlinkSync(dest);
+            }
+            fs.renameSync(tmp, dest);
             resolve();
-          });
+          } catch (err) {
+            try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
+            reject(err);
+          }
         });
       });
-      stream.on('error', (err) => { fs.unlink(tmpPath, () => {}); reject(err); });
-      res.on('error',   (err) => { fs.unlink(tmpPath, () => {}); reject(err); });
-    });
-    req.on('error', (err) => reject(new Error(`[ytdlp-manager] Red: ${err.message}`)));
-  });
-}
 
-/**
- * Aplica chmod 755 en POSIX. No-op en Windows.
- * @param {string} binaryPath
- * @returns {Promise<void>}
- */
-function _makeExecutable(binaryPath) {
-  if (IS_WINDOWS) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    fs.chmod(binaryPath, EXEC_MODE, (err) => {
-      if (err) return reject(err);
-      console.log(`[BINARY CHECK] chmod 755 aplicado: ${binaryPath}`);
-      resolve();
+      out.on('error', (e) => {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
+        reject(e);
+      });
+
+      res.on('error', (e) => {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
+        reject(e);
+      });
+    });
+
+    req.on('error', (e) => reject(new Error(`Error de red: ${e.message}`)));
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Tiempo de espera agotado (timeout) descargando yt-dlp'));
     });
   });
 }
 
 /**
- * Verifica y corrige el bit +x si falta (Linux).
- * Puede ocurrir si el archivo se copió desde un FS montado noexec.
- * @param {string} binaryPath
+ * Aplica permisos de ejecución chmod 755 (Solo en POSIX/Linux/macOS, NO en Windows).
+ * @param {string} p
  */
-function _ensureExecutableBit(binaryPath) {
-  if (IS_WINDOWS) return;
+function makeExecutable(p) {
+  if (IS_WIN) return; // En Windows no se ejecuta chmod
   try {
-    const stat = fs.statSync(binaryPath);
-    if ((stat.mode & 0o111) === 0) {
-      console.warn(`[BINARY CHECK] Bit +x ausente en ${binaryPath}. Aplicando chmodSync...`);
-      fs.chmodSync(binaryPath, EXEC_MODE);
-      console.log('[BINARY CHECK] Permisos corregidos OK.');
-    } else {
-      console.log(`[BINARY CHECK] Permisos OK (mode=${stat.mode.toString(8)}): ${binaryPath}`);
-    }
-  } catch (err) {
-    console.warn(`[BINARY CHECK] No se pudo verificar permisos: ${err.message}`);
+    fs.chmodSync(p, EXEC_MODE);
+    console.log(`[ytdlp-manager] chmod 755 aplicado a: ${p}`);
+  } catch (e) {
+    console.warn(`[ytdlp-manager] No se pudo aplicar chmod a ${p}: ${e.message}`);
   }
 }
 
 /**
- * Valida que el binario descargado sea real y no un HTML de error:
- *   1. Tamaño > MIN_BINARY_SIZE
- *   2. Ejecución de `yt-dlp --version` con exit 0
- * @param {string} binaryPath
+ * Valida la integridad funcional y tamaño del binario.
+ * @param {string} p
  * @returns {{ valid: boolean, version?: string, error?: string }}
  */
-function validateBinary(binaryPath) {
-  console.log(`[BINARY CHECK] Validando binario: ${binaryPath}`);
-
-  // 1. Existencia
-  if (!fs.existsSync(binaryPath)) {
-    return { valid: false, error: 'El archivo no existe.' };
+function validateBinary(p) {
+  if (!fs.existsSync(p)) {
+    return { valid: false, error: 'El archivo no existe en el disco.' };
   }
 
-  // 2. Tamaño mínimo
-  const stat = fs.statSync(binaryPath);
-  console.log(`[BINARY CHECK] Tamaño: ${(stat.size / 1_000_000).toFixed(2)} MB (mínimo: ${MIN_BINARY_SIZE / 1_000_000} MB)`);
-  if (stat.size < MIN_BINARY_SIZE) {
-    return {
-      valid: false,
-      error: `Binario demasiado pequeño (${stat.size} bytes). Probablemente es un HTML de error.`,
-    };
-  }
-
-  // 3. Prueba de ejecución: yt-dlp --version
   try {
-    const version = execFileSync(binaryPath, ['--version'], {
-      timeout:     10_000,
-      encoding:    'utf8',
+    const stat = fs.statSync(p);
+    if (stat.size < MIN_SIZE) {
+      return { valid: false, error: `Tamaño insuficiente (${stat.size} bytes). Archivo corrupto o error HTML.` };
+    }
+
+    const version = execFileSync(p, ['--version'], {
+      timeout: 10_000,
+      encoding: 'utf8',
       windowsHide: true,
     }).trim();
-    console.log(`[BINARY CHECK] yt-dlp --version OK: ${version}`);
+
     return { valid: true, version };
-  } catch (err) {
-    return {
-      valid: false,
-      error: `yt-dlp --version falló: ${err.message}`,
-    };
+  } catch (e) {
+    return { valid: false, error: `Fallo al ejecutar '${p} --version': ${e.message}` };
   }
 }
 
 /**
- * Resuelve el directorio de descarga por defecto, garantizando que sea escribible.
- * Cascada de candidatos:
- *   1. app.getPath('downloads') — directorio de descargas del sistema
- *   2. ~/Music
- *   3. ~/Documents
- *   4. os.tmpdir()/MusicDown — siempre disponible
- * @param {Electron.App} app
- * @returns {string} Ruta absoluta escribible.
+ * Resuelve y crea el directorio de descargas con ruta absoluta y normalizada.
+ * @param {Electron.App} appInstance
+ * @returns {string} Ruta absoluta normalizada.
  */
-function resolveOutputDir(app) {
+function resolveOutputDir(appInstance) {
+  let downloadsBase = '';
+  try {
+    downloadsBase = appInstance.getPath('downloads');
+  } catch {
+    downloadsBase = path.join(os.homedir(), 'Downloads');
+  }
+
   const candidates = [
-    path.join(app.getPath('downloads'), 'MusicDown'),
-    path.join(os.homedir(), 'Music', 'MusicDown'),
-    path.join(os.homedir(), 'Documents', 'MusicDown'),
-    path.join(os.tmpdir(), 'MusicDown'),
+    path.normalize(path.join(downloadsBase, 'MusicDown')),
+    path.normalize(path.join(os.homedir(), 'Music', 'MusicDown')),
+    path.normalize(path.join(os.homedir(), 'Documents', 'MusicDown')),
+    path.normalize(path.join(os.tmpdir(), 'MusicDown')),
   ];
 
   for (const dir of candidates) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      // Prueba de escritura real
-      const testFile = path.join(dir, '.write_test');
-      fs.writeFileSync(testFile, 'ok');
-      fs.unlinkSync(testFile);
-      console.log(`[ytdlp-manager] Directorio de salida escribible: ${dir}`);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const probe = path.join(dir, '.write_probe_' + Date.now());
+      fs.writeFileSync(probe, 'ok');
+      fs.unlinkSync(probe);
+      console.log(`[ytdlp-manager] Directorio de descargas listo: ${dir}`);
       return dir;
     } catch {
-      console.warn(`[ytdlp-manager] Directorio no escribible: ${dir}`);
+      console.warn(`[ytdlp-manager] Candidato no escribible: ${dir}`);
     }
   }
 
-  // Fallback absoluto: directorio temporal del sistema operativo
-  const fallback = os.tmpdir();
-  console.warn(`[ytdlp-manager] Usando fallback de emergencia: ${fallback}`);
+  const fallback = path.normalize(path.join(os.tmpdir(), 'MusicDown'));
+  try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
   return fallback;
 }
 
-// ─── API Pública ──────────────────────────────────────────────────────────────
+/**
+ * Resuelve la ruta de FFmpeg.
+ * @param {Electron.App} appInstance
+ * @returns {string|null}
+ */
+function resolveFfmpeg(appInstance) {
+  // 1. Bundleado en backend/bin/
+  const ffmpegName = IS_WIN ? 'ffmpeg.exe' : 'ffmpeg';
+  const bundled = appInstance.isPackaged
+    ? path.join(process.resourcesPath, '..', 'backend', 'bin', ffmpegName)
+    : path.join(__dirname, '..', '..', 'backend', 'bin', ffmpegName);
 
-/** Ruta al binario yt-dlp resuelto. */
-function getYtDlpPath() { return _resolvedBinaryPath; }
+  if (fs.existsSync(bundled)) {
+    console.log(`[ytdlp-manager] FFmpeg bundleado detectado: ${bundled}`);
+    return bundled;
+  }
 
-/** Ruta al binario ffmpeg resuelto (bundleado o del sistema). */
-function getFfmpegPath() { return _ffmpegPath; }
+  // 2. Sistema global en Linux (/usr/bin/ffmpeg, /usr/local/bin/ffmpeg)
+  if (!IS_WIN) {
+    const sysPaths = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'];
+    for (const p of sysPaths) {
+      if (fs.existsSync(p)) {
+        console.log(`[ytdlp-manager] FFmpeg global detectado: ${p}`);
+        return p;
+      }
+    }
+  }
 
-/** Directorio de salida escribible resuelto. */
-function getOutputDir()  { return _outputDir; }
+  // 3. Comprobación en PATH del sistema
+  try {
+    const cmd = IS_WIN ? 'where' : 'which';
+    const out = execFileSync(cmd, [ffmpegName], { encoding: 'utf8', windowsHide: true })
+      .trim().split(/\r?\n/)[0].trim();
+    if (out && fs.existsSync(out)) {
+      console.log(`[ytdlp-manager] FFmpeg en PATH: ${out}`);
+      return out;
+    }
+  } catch {
+    // FFmpeg no encontrado en PATH
+  }
+
+  console.warn('[ytdlp-manager] ⚠️ FFmpeg no encontrado en el sistema ni en el bundle.');
+  return null;
+}
 
 /**
- * Lanza `yt-dlp -U` en background sin bloquear.
- * Ignora errores de red silenciosamente.
- * @param {string} binaryPath
+ * Ejecuta yt-dlp -U en segundo plano de manera no bloqueante.
+ * @param {string} p
  */
-function updateYtDlpInBackground(binaryPath) {
-  console.log('[ytdlp-manager] Lanzando yt-dlp -U en background...');
-  execFile(binaryPath, ['-U'], { timeout: 90_000, windowsHide: true }, (err, stdout, stderr) => {
+function updateInBackground(p) {
+  console.log('[ytdlp-manager] Verificando actualizaciones con yt-dlp -U...');
+  execFile(p, ['-U'], { timeout: 90_000, windowsHide: true }, (err, stdout, stderr) => {
     if (err) {
-      const out = ((stdout || '') + (stderr || '')).toLowerCase();
-      if (out.includes('up to date') || out.includes('up-to-date')) {
-        console.log('[ytdlp-manager] yt-dlp ya esta en la ultima version.');
-      } else {
-        console.warn('[ytdlp-manager] Actualizacion fallida (probablemente sin red):', err.message);
-      }
+      console.log('[ytdlp-manager] yt-dlp -U no pudo actualizar (modo offline o última versión):', err.message);
       return;
     }
-    console.log('[ytdlp-manager] yt-dlp -U:', ((stdout || stderr || '').trim() || '(sin salida)'));
+    const out = ((stdout || '') + (stderr || '')).trim();
+    console.log('[ytdlp-manager] yt-dlp -U resultado:', out || 'Actualizado.');
   });
 }
 
+// ─── Inicialización Principal ─────────────────────────────────────────────────
+
 /**
- * Punto de entrada principal. Llamar en `app.whenReady()` ANTES de `createWindow()`.
+ * Inicializa yt-dlp, FFmpeg y las carpetas del sistema emitiendo eventos de estado.
+ * Se llama en app.whenReady() antes o durante la creación de la ventana.
  *
- * Resuelve:
- *   - Ruta de ffmpeg bundleado o del sistema.
- *   - Directorio de descarga escribible.
- *   - Binario yt-dlp (descarga si no existe, valida si existe).
- *
- * @param {Electron.App} app
- * @returns {Promise<string>} Ruta al binario yt-dlp.
+ * @param {Electron.App} appInstance
+ * @returns {Promise<string>} Ruta validada al binario de yt-dlp.
  */
-async function ensureYtDlp(app) {
-  const binDir     = _getBinDir(app);
-  const binaryPath = path.join(binDir, BINARY_NAME);
+async function ensureYtDlp(appInstance) {
+  if (_initPromise) return _initPromise;
 
-  // ── 1. Resolver ffmpeg ────────────────────────────────────────────────────
-  const bundledFfmpeg = app.isPackaged
-    ? path.join(process.resourcesPath, '..', 'backend', 'bin', IS_WINDOWS ? 'ffmpeg.exe' : 'ffmpeg')
-    : path.join(__dirname, 'backend', 'bin', IS_WINDOWS ? 'ffmpeg.exe' : 'ffmpeg');
+  _initPromise = (async () => {
+    broadcastStatus('INITIALIZING', 'Inicializando dependencias del sistema y motor yt-dlp...');
 
-  if (fs.existsSync(bundledFfmpeg)) {
-    _ffmpegPath = bundledFfmpeg;
-    console.log(`[ytdlp-manager] ffmpeg bundleado: ${_ffmpegPath}`);
-  } else {
+    // 1. Resolver FFmpeg y directorio de descargas
+    _ffmpegPath = resolveFfmpeg(appInstance);
+    _outputDir = resolveOutputDir(appInstance);
+
+    // 2. Resolver ubicación candidata de yt-dlp
+    const candidatePath = getYtDlpPath(appInstance);
+    console.log(`[ytdlp-manager] Ruta evaluada para yt-dlp: ${candidatePath}`);
+
+    // Si ya existe en el disco, validarlo
+    if (fs.existsSync(candidatePath)) {
+      makeExecutable(candidatePath);
+      const val = validateBinary(candidatePath);
+
+      if (val.valid) {
+        _binaryPath = candidatePath;
+        broadcastStatus('READY', `yt-dlp v${val.version} listo para operar.`, { version: val.version });
+        updateInBackground(_binaryPath);
+        return _binaryPath;
+      } else {
+        console.warn(`[ytdlp-manager] Binario existente no válido (${val.error}). Reintentando descarga limpia...`);
+        try { fs.unlinkSync(candidatePath); } catch {}
+      }
+    }
+
+    // 3. Descarga desde fuente oficial de GitHub Releases
+    const targetPath = path.normalize(path.join(appInstance.getPath('userData'), 'bin', BIN_NAME));
+    const targetDir = path.dirname(targetPath);
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true, mode: DIR_MODE });
+    }
+
+    broadcastStatus('INITIALIZING', `Descargando motor ${BIN_NAME} desde GitHub Releases, por favor espere...`);
+    console.log(`[ytdlp-manager] Iniciando descarga desde: ${DOWNLOAD_URL} -> ${targetPath}`);
+
     try {
-      const cmd = IS_WINDOWS ? 'where' : 'which';
-      _ffmpegPath = execFileSync(cmd, ['ffmpeg'], { encoding: 'utf8', windowsHide: true })
-        .trim().split('\n')[0].trim();
-      console.log(`[ytdlp-manager] ffmpeg del sistema: ${_ffmpegPath}`);
-    } catch {
-      _ffmpegPath = null;
-      console.warn('[ytdlp-manager] ADVERTENCIA: ffmpeg no encontrado. Conversion a MP3 desactivada.');
+      await downloadFile(DOWNLOAD_URL, targetPath);
+      makeExecutable(targetPath);
+
+      const valPost = validateBinary(targetPath);
+      if (!valPost.valid) {
+        try { fs.unlinkSync(targetPath); } catch {}
+        throw new Error(`Validación de binario fallida tras descarga: ${valPost.error}`);
+      }
+
+      _binaryPath = targetPath;
+      broadcastStatus('READY', `yt-dlp v${valPost.version} descargado e instalado correctamente.`, { version: valPost.version });
+      return _binaryPath;
+
+    } catch (dlErr) {
+      console.error(`[ytdlp-manager] Error durante la descarga/instalación de yt-dlp: ${dlErr.message}`);
+      _binaryPath = targetPath; // Mantenemos la ruta esperada para no romper referencias
+      broadcastStatus('ERROR', `Error al inicializar yt-dlp: ${dlErr.message}`);
+      throw dlErr;
     }
-  }
+  })();
 
-  // ── 2. Resolver directorio de salida escribible ───────────────────────────
-  _outputDir = resolveOutputDir(app);
-
-  // ── 3. Crear directorio bin ───────────────────────────────────────────────
-  if (!fs.existsSync(binDir)) {
-    fs.mkdirSync(binDir, { recursive: true, mode: DIR_MODE });
-    if (!IS_WINDOWS) {
-      try { fs.chmodSync(binDir, DIR_MODE); } catch {}
-    }
-  }
-
-  if (fs.existsSync(binaryPath)) {
-    // Caso A: Ya existe — verificar permisos y validar
-    console.log(`[ytdlp-manager] Binario encontrado: ${sanitizePath(binaryPath)}`);
-    _ensureExecutableBit(binaryPath);
-
-    const validation = validateBinary(binaryPath);
-    if (!validation.valid) {
-      console.error(`[BINARY CHECK] Binario invalido: ${validation.error}`);
-      console.log('[ytdlp-manager] Eliminando binario corrupto y re-descargando...');
-      fs.unlinkSync(binaryPath);
-      // Recursion: descargará de nuevo en el siguiente bloque
-      return ensureYtDlp(app);
-    }
-
-    _resolvedBinaryPath = binaryPath;
-    updateYtDlpInBackground(binaryPath);
-  } else {
-    // Caso B: No existe — descargar, permisos, validar
-    console.log(`[ytdlp-manager] Descargando yt-dlp desde fuente oficial...`);
-    await _downloadFile(DOWNLOAD_URL, binaryPath);
-    await _makeExecutable(binaryPath);
-    _ensureExecutableBit(binaryPath);
-
-    const validation = validateBinary(binaryPath);
-    if (!validation.valid) {
-      fs.unlinkSync(binaryPath);
-      throw new Error(`[ytdlp-manager] Binario descargado inválido: ${validation.error}`);
-    }
-
-    console.log(`[ytdlp-manager] yt-dlp ${validation.version} listo.`);
-    _resolvedBinaryPath = binaryPath;
-  }
-
-  return _resolvedBinaryPath;
+  return _initPromise;
 }
 
+// ─── Exportaciones Públicas ───────────────────────────────────────────────────
+
 module.exports = {
+  initYtDlp: ensureYtDlp,
   ensureYtDlp,
-  validateBinary,
-  updateYtDlpInBackground,
   getYtDlpPath,
-  getFfmpegPath,
-  getOutputDir,
+  getBinaryPath: () => _binaryPath || (typeof app !== 'undefined' ? getYtDlpPath(app) : null),
+  getFfmpegPath: () => _ffmpegPath,
+  getOutputDir: () => _outputDir,
+  getYtDlpStatus: () => _status,
+  isYtDlpReady: () => _status === 'READY',
   sanitizePath,
+  validateBinary,
 };

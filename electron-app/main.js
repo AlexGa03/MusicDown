@@ -1,100 +1,47 @@
 'use strict';
 
 /**
- * @file main.js
- * @description Proceso principal de Electron (Main Process).
+ * @file src/main/main.js
+ * @description Proceso principal de Electron.
  *
- * Orden de arranque:
- *   1. ensureYtDlp(app)           — descarga o actualiza el binario yt-dlp
- *   2. registerDownloadHandlers() — registra canales IPC ANTES de crear la ventana
- *   3. spawn(backendPath)         — lanza el backend Python (FastAPI)
- *   4. waitForBackend()           — espera health-check en :8000
- *   5. createWindow()             — crea la BrowserWindow con preload.js
+ * Secuencia de Inicialización Segura:
+ *   1. registerHandlers(ipcMain, app) -> Registra canales IPC antes de la ventana.
+ *   2. createWindow()                  -> Crea y muestra la BrowserWindow inmediatamente.
+ *   3. ensureYtDlp(app)                -> Descarga/valida yt-dlp y emite eventos de estado en tiempo real.
  */
 
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
-const path   = require('path');
-const { spawn } = require('child_process');
-const axios  = require('axios');
+const path = require('path');
 
-// Extensiones .js explícitas: garantizan la resolución dentro de app.asar en producción.
-// Node.js dentro del .asar no siempre resuelve extensiones omitidas correctamente.
 const { ensureYtDlp, sanitizePath } = require('./ytdlp-manager.js');
-const { registerDownloadHandlers }  = require('./ipc-download-handler.js');
+const { registerHandlers }          = require('./ipc-download-handler.js');
 
-// ─── Estado global ────────────────────────────────────────────────────────────
+// ─── Ajustes de Rendimiento y Virtualización ──────────────────────────────────
 
-/** @type {import('child_process').ChildProcess|null} */
-let backendProcess = null;
-
-// ─── Ajustes de arranque ──────────────────────────────────────────────────────
-
-// Deshabilitar aceleración GPU en entornos Linux sin drivers OpenGL
+// Previene bloqueos en entornos headless, Docker y GPU virtuales
 app.commandLine.appendSwitch('disable-gpu');
 app.commandLine.appendSwitch('disable-software-rasterizer');
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Ventana Principal ────────────────────────────────────────────────────────
 
-/**
- * Espera a que el backend Python responda en la URL indicada.
- * @param {string}  url              - URL de health-check.
- * @param {number} [timeout=15000]   - Tiempo máximo en ms.
- * @returns {Promise<true>}
- * @throws {Error} Si el backend no responde en el tiempo límite.
- */
-async function waitForBackend(url, timeout = 15_000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    try {
-      await axios.get(url, { timeout: 2000 });
-      return true;
-    } catch {
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
-  throw new Error(`Backend no respondió en ${timeout}ms: ${url}`);
-}
+/** @type {BrowserWindow|null} */
+let mainWindow = null;
 
-/**
- * Resuelve la ruta al ejecutable del backend Python.
- * Contempla empaquetado (AppImage / NSIS) y modo desarrollo.
- * @returns {string}
- */
-function resolveBackendPath() {
-  if (process.platform === 'win32') {
-    return app.isPackaged
-      ? path.join(process.resourcesPath, '..', 'backend', 'backend.exe')
-      : path.join(__dirname, 'dist', 'backend', 'backend.exe');
-  }
-  // Linux / macOS / AppImage
-  return app.isPackaged
-    ? path.join(process.resourcesPath, '..', 'backend', 'backend')
-    : path.join(__dirname, 'dist', 'backend', 'backend');
-}
-
-/**
- * Resuelve la ruta al directorio del frontend compilado.
- * @returns {string}
- */
-function resolveFrontendPath() {
-  return app.isPackaged
-    ? path.join(process.resourcesPath, '..', 'frontend')
-    : path.join(__dirname, 'dist', 'frontend');
-}
-
-/**
- * Crea la ventana principal del renderer.
- * El preload.js expone `window.ytdlp` al renderer vía contextBridge.
- */
 function createWindow() {
   const iconPath = app.isPackaged
     ? path.join(process.resourcesPath, 'assets', 'logo.png')
-    : path.join(__dirname, 'assets', 'logo.png');
+    : path.join(__dirname, '..', '..', 'assets', 'logo.png');
 
-  const win = new BrowserWindow({
-    width:  1200,
-    height: 800,
-    icon:   iconPath,
+  const preloadPath = path.join(__dirname, '..', 'preload.js');
+  const indexHtml   = path.join(__dirname, '..', 'renderer', 'index.html');
+
+  mainWindow = new BrowserWindow({
+    width:           1100,
+    height:          700,
+    minWidth:        800,
+    minHeight:       560,
+    icon:            iconPath,
+    backgroundColor: '#111827',
     webPreferences: {
       nodeIntegration:             false,
       contextIsolation:            true,
@@ -102,102 +49,91 @@ function createWindow() {
       webSecurity:                 true,
       allowRunningInsecureContent: false,
       navigateOnDragDrop:          false,
-      preload:                     path.join(__dirname, 'preload.js'),
+      preload:                     preloadPath,
     },
   });
 
-  // Interceptar navegación no autorizada
-  win.webContents.on('will-navigate', (event, navigationUrl) => {
+  // Bloquear navegación no autorizada fuera de la app
+  mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
     try {
       const parsedUrl = new URL(navigationUrl);
       if (parsedUrl.protocol !== 'file:') {
         event.preventDefault();
-        console.warn('[security] Bloqueada navegación no autorizada a:', parsedUrl.protocol);
+        console.warn('[security] Navegación bloqueada a protocolo externo:', parsedUrl.protocol);
       }
     } catch {
       event.preventDefault();
     }
   });
 
-  // Gestionar apertura de enlaces externos
-  win.webContents.setWindowOpenHandler(({ url }) => {
+  // Control estricto de apertura de ventanas externas
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     try {
       const parsed = new URL(url);
       if (parsed.protocol === 'https:') {
         shell.openExternal(url).catch(err => {
-          console.warn('[security] Error abriendo URL externa:', err.message);
+          console.warn('[security] Error al abrir enlace en navegador:', err.message);
         });
-      } else {
-        console.warn('[security] Bloqueada apertura de protocolo inseguro:', parsed.protocol);
       }
     } catch {
-      console.warn('[security] URL inválida en setWindowOpenHandler');
+      console.warn('[security] URL inválida detectada en setWindowOpenHandler');
     }
     return { action: 'deny' };
   });
 
-  const indexPath = app.isPackaged
-    ? path.join(process.resourcesPath, '..', 'frontend', 'index.html')
-    : path.join(__dirname, 'dist', 'frontend', 'index.html');
+  mainWindow.loadFile(indexHtml);
 
-  win.loadFile(indexPath);
-}
-
-// ─── Ciclo de vida ────────────────────────────────────────────────────────────
-
-app.whenReady().then(async () => {
-  const backendPath  = resolveBackendPath();
-  const frontendPath = resolveFrontendPath();
-
-  console.log('[main] Backend listo (iniciando)...');
-
-  // ── 1. Asegurar binario yt-dlp ────────────────────────────────────────────
-  try {
-    const ytdlpPath = await ensureYtDlp(app);
-    console.log('[main] yt-dlp listo:', sanitizePath(ytdlpPath));
-  } catch (err) {
-    console.error('[main] No se pudo inicializar yt-dlp:', err.message);
+  if (!app.isPackaged) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
 
-  // ── 2. Registrar handlers IPC ANTES de crear la ventana ───────────────────
-  // Es crítico que los handlers estén registrados antes de que el renderer
-  // cargue el HTML y pueda invocar ipcRenderer.invoke().
-  registerDownloadHandlers(ipcMain);
-
-  // ── 3. Lanzar el backend Python ────────────────────────────────────────────
-  backendProcess = spawn(backendPath, ['--frontend-path', frontendPath], {
-    stdio:       ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,   // En Windows, evita una ventana de consola CMD
+  mainWindow.webContents.on('did-fail-load', (_event, code, desc) => {
+    console.error(`[main] Error al cargar renderer: code=${code} desc=${desc}`);
   });
 
-  backendProcess.stdout.on('data', (d) => console.log(`[BACKEND] ${d}`.trimEnd()));
-  backendProcess.stderr.on('data', (d) => console.error(`[BACKEND ERR] ${d}`.trimEnd()));
-  backendProcess.on('error', (err) => console.error('[BACKEND] Error de proceso:', err.message));
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[main] Proceso renderer finalizado de forma inesperada:', details.reason);
+  });
 
-  // ── 4. Esperar al backend y abrir la ventana ───────────────────────────────
-  try {
-    await waitForBackend('http://127.0.0.1:8000');
-    console.log('[main] Backend listo. Creando ventana...');
-    createWindow();
-  } catch (err) {
-    console.error('[main] El backend no arrancó:', err.message);
-    if (app.isPackaged) app.quit();
-    else createWindow(); // En dev abrimos igual para ver errores en DevTools
-  }
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+// ─── Ciclo de Vida de la Aplicación ──────────────────────────────────────────
+
+app.whenReady().then(async () => {
+  console.log('[main] app.whenReady() START');
+  console.log('[main] userData:', app.getPath('userData'));
+  console.log('[main] downloads:', app.getPath('downloads'));
+
+  // 1. Registrar handlers IPC antes de crear la ventana
+  registerHandlers(ipcMain, app);
+  console.log('[main] Handlers IPC registrados correctamente.');
+
+  // 2. Crear y renderizar la interfaz de usuario
+  createWindow();
+  console.log('[main] Ventana principal creada.');
+
+  // 3. Inicializar motor yt-dlp y dependencias de forma asíncrona tolerante a fallos
+  ensureYtDlp(app)
+    .then((resolvedPath) => {
+      console.log('[main] yt-dlp inicializado y verificado OK en:', resolvedPath);
+    })
+    .catch((err) => {
+      console.error('[main] ensureYtDlp reportó error de inicialización:', err.message);
+      console.log('[main] La aplicación continuará activa permitiendo reintentar desde la UI.');
+    });
 });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
-    if (backendProcess) backendProcess.kill();
     app.quit();
   }
 });
 
-app.on('before-quit', () => {
-  if (backendProcess) backendProcess.kill();
-});
-
-// macOS: re-crear ventana si la app sigue activa y no hay ventanas abiertas
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
+  }
 });

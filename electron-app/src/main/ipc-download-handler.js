@@ -1,36 +1,8 @@
 'use strict';
 
 /**
- * @file ipc-download-handler.js
- * @description Orquestador de cola de descargas. Gestiona el ciclo de vida
- * completo: cola, spawn de yt-dlp, parseo de streams y eventos IPC.
- *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │  CANALES IPC  (renderer → main, via ipcRenderer.invoke)                  │
- * ├───────────────────┬─────────────────────────────────────────────────────┤
- * │ app:addItems      │ [{ url, title? }] → añade a la cola interna          │
- * │ app:startQueue    │ {} → arranca el procesador de cola                   │
- * │ app:stop          │ {} → mata el proceso activo y cancela la cola         │
- * │ app:clear         │ {} → vacía la cola (solo si no hay descarga activa)  │
- * │ app:openFolder    │ {} → abre el dir de descargas con shell.openPath()   │
- * │ app:getStatus     │ {} → devuelve estado actual del manager              │
- * │ app:playlistAnswer│ { url, downloadAll: boolean } → resuelve el prompt   │
- * └───────────────────┴─────────────────────────────────────────────────────┘
- *
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │  EVENTOS IPC  (main → renderer, via webContents.send)                    │
- * ├───────────────────┬─────────────────────────────────────────────────────┤
- * │ app:log           │ { level, msg, ts }                                   │
- * │ app:progress      │ { index, total, title, percent, speed, eta }         │
- * │ app:queueUpdate   │ { queue: QueueItem[], active: boolean }              │
- * │ app:done          │ { index, total, title, outputPath }                  │
- * │ app:error         │ { index, total, title, message }                     │
- * │ app:queueDone     │ { completed, errors }                                │
- * │ app:playlistPrompt│ { url, title } — renderer debe responder por invoke  │
- * └───────────────────┴─────────────────────────────────────────────────────┘
- *
- * @typedef {{ url: string, title: string, isPlaylist: boolean,
- *             status: 'pending'|'active'|'done'|'error' }} QueueItem
+ * @file src/main/ipc-download-handler.js
+ * @description Orquestador de cola de descargas y comunicación IPC con el proceso Renderer.
  */
 
 const { spawn }  = require('child_process');
@@ -38,18 +10,20 @@ const { shell }  = require('electron');
 const path       = require('path');
 const os         = require('os');
 const fs         = require('fs');
-const { getBinaryPath, getFfmpegPath, getOutputDir, sanitizePath } = require('./ytdlp-manager.js');
-
-// ─── Utilidades ───────────────────────────────────────────────────────────────
+const {
+  getYtDlpPath,
+  getBinaryPath,
+  getFfmpegPath,
+  getOutputDir,
+  getYtDlpStatus,
+  isYtDlpReady,
+  sanitizePath,
+} = require('./ytdlp-manager.js');
 
 const IS_WIN = process.platform === 'win32';
 
-/**
- * Sanitiza una cadena de entrada eliminando caracteres de control y limitando la longitud.
- * @param {any} input
- * @param {number} [maxLength=2048]
- * @returns {string}
- */
+// ─── Utilidades de Sanitización y Validación ─────────────────────────────────
+
 function sanitizeInputString(input, maxLength = 2048) {
   if (typeof input !== 'string') return '';
   return input
@@ -58,31 +32,14 @@ function sanitizeInputString(input, maxLength = 2048) {
     .slice(0, maxLength);
 }
 
-/**
- * Detecta si una cadena es una URL de YouTube con parámetro de playlist.
- * @param {string} s
- * @returns {boolean}
- */
 function isPlaylistUrl(s) {
   return /list=/.test(s) && /youtube\.com|youtu\.be/.test(s);
 }
 
-/**
- * Detecta si una cadena es una URL de YouTube (no necesariamente playlist).
- * @param {string} s
- * @returns {boolean}
- */
 function isYouTubeUrl(s) {
   return /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//.test(s);
 }
 
-/**
- * Normaliza una entrada del usuario al formato { url, title, isPlaylist }.
- * - URL de YouTube válida → usa tal cual.
- * - Texto libre           → convierte a ytsearch1:<texto>.
- * @param {string} input
- * @returns {{ url: string, title: string, isPlaylist: boolean, status: string }|null}
- */
 function normalizeInput(input) {
   const s = sanitizeInputString(input);
   if (!s) return null;
@@ -98,29 +55,15 @@ function normalizeInput(input) {
   };
 }
 
-// ─── Estado global del orquestador ───────────────────────────────────────────
+// ─── Estado de la Cola ────────────────────────────────────────────────────────
 
-/** @type {QueueItem[]} Cola principal de descargas. */
 let _queue = [];
-
-/** @type {import('child_process').ChildProcess|null} Proceso activo. */
 let _activeChild = null;
-
-/** Flag para abortar el bucle de cola. */
 let _stopRequested = false;
-
-/** @type {Map<string, { resolve: Function, reject: Function }>}
- *  Promesas pendientes de confirmación de playlist. */
 const _playlistPrompts = new Map();
 
-// ─── Helper de envío IPC seguro ───────────────────────────────────────────────
+// ─── Helpers IPC ─────────────────────────────────────────────────────────────
 
-/**
- * Envía un evento IPC al renderer de forma segura (sin throw si isDestroyed).
- * @param {Electron.WebContents} wc
- * @param {string} channel
- * @param {any} payload
- */
 function emit(wc, channel, payload) {
   try {
     if (wc && !wc.isDestroyed()) wc.send(channel, payload);
@@ -129,15 +72,13 @@ function emit(wc, channel, payload) {
   }
 }
 
-/** Emite un log con timestamp y mensaje sanitizado. */
 function log(wc, msg, level = 'info') {
   const ts = new Date().toLocaleTimeString('es-ES', { hour12: false });
-  const sanitizedMsg = sanitizePath(typeof msg === 'string' ? msg : JSON.stringify(msg));
-  console.log(`[${level.toUpperCase()}] ${sanitizedMsg}`);
-  emit(wc, 'app:log', { level, msg: sanitizedMsg, ts });
+  const rawMsg = typeof msg === 'string' ? msg : JSON.stringify(msg);
+  console.log(`[${level.toUpperCase()}] ${rawMsg}`);
+  emit(wc, 'app:log', { level, msg: rawMsg, ts });
 }
 
-/** Emite el estado actual de la cola. */
 function broadcastQueue(wc) {
   emit(wc, 'app:queueUpdate', {
     queue:  _queue,
@@ -145,28 +86,21 @@ function broadcastQueue(wc) {
   });
 }
 
-// ─── Construcción de argumentos CLI ──────────────────────────────────────────
+// ─── Construcción de Argumentos CLI ──────────────────────────────────────────
 
-/**
- * Construye el array de flags para yt-dlp según la especificación.
- * Utiliza '--' antes de la URL para evitar Argument/Option Injection.
- *
- * @param {string} url
- * @param {object} opts
- * @param {boolean} [opts.downloadAll=false]   Para playlists: descarga completa vs solo canción.
- * @param {string}  [opts.outputDir]           Directorio de salida.
- * @param {string}  [opts.ffmpegLocation]      Ruta a ffmpeg.
- * @returns {string[]}
- */
 function buildArgs(url, opts = {}) {
   const {
     downloadAll    = false,
-    outputDir      = getOutputDir() || path.join(os.tmpdir(), 'MusicDown'),
+    outputDir      = getOutputDir() || path.normalize(path.join(os.homedir(), 'Downloads', 'MusicDown')),
     ffmpegLocation = getFfmpegPath(),
   } = opts;
 
-  // Garantizar que el directorio de salida existe y es escribible
-  try { fs.mkdirSync(outputDir, { recursive: true }); } catch { /* ya existe */ }
+  const normalizedOutDir = path.normalize(outputDir);
+  try {
+    if (!fs.existsSync(normalizedOutDir)) {
+      fs.mkdirSync(normalizedOutDir, { recursive: true });
+    }
+  } catch {}
 
   const args = [
     '--newline',
@@ -174,48 +108,33 @@ function buildArgs(url, opts = {}) {
     '--progress',
   ];
 
-  // Control de playlist
   args.push(downloadAll ? '--yes-playlist' : '--no-playlist');
 
-  // Extracción de audio (solo si ffmpeg disponible)
-  if (ffmpegLocation && typeof ffmpegLocation === 'string') {
+  if (ffmpegLocation && typeof ffmpegLocation === 'string' && fs.existsSync(ffmpegLocation)) {
     args.push(
       '-x',
       '--audio-format', 'mp3',
       '--audio-quality', '0',
-      '--ffmpeg-location', ffmpegLocation,
+      '--ffmpeg-location', ffmpegLocation
     );
   } else {
-    // Fallback sin conversión: descarga el mejor audio disponible
-    console.warn('[ipc] ffmpeg no disponible. Descargando sin conversión a MP3.');
+    console.warn('[ipc] FFmpeg no disponible. Descargando stream original sin conversión.');
     args.push('-f', 'bestaudio');
   }
 
-  args.push('-o', path.join(outputDir, '%(title)s.%(ext)s'));
-
-  // SEGURIDAD: Separador de fin de opciones para evitar que URLs o búsquedas
-  // con guiones sean interpretadas como flags por yt-dlp.
+  args.push('-o', path.join(normalizedOutDir, '%(title)s.%(ext)s'));
   args.push('--', url);
 
   return args;
 }
 
-// ─── Parseo de stdout de yt-dlp ──────────────────────────────────────────────
+// ─── Parseo de Salida de yt-dlp ──────────────────────────────────────────────
 
-// [download]  45.2% of ~  4.20MiB at  1.23MiB/s ETA 00:02
 const RE_PROGRESS    = /\[download\]\s+([\d.]+)%\s+of\s+\S+\s+at\s+([\d.]+\s*\S+\/s)\s+ETA\s+([\d:]+)/;
-// [download] Destination: /path/to/file.webm
 const RE_DESTINATION = /\[download\]\s+Destination:\s+(.+)/;
-// [ExtractAudio] Destination: /path/to/file.mp3
 const RE_EXTRACT     = /\[ExtractAudio\].*Destination:\s+(.+)/;
-// [ffmpeg] Destination: ...
 const RE_FFMPEG      = /\[ffmpeg\].*Destination:\s+(.+)/;
 
-/**
- * Parsea una línea de stdout de yt-dlp.
- * @param {string} raw
- * @returns {{ type: string, [k: string]: any }|null}
- */
 function parseLine(raw) {
   const line = raw.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').trim();
   if (!line) return null;
@@ -230,40 +149,30 @@ function parseLine(raw) {
   return { type: 'raw', text: line };
 }
 
-// ─── Spawn de un item ─────────────────────────────────────────────────────────
+// ─── Ejecución de Descarga Individual ────────────────────────────────────────
 
-/**
- * Descarga un solo item de la cola. La Promise siempre se resuelve
- * (nunca rechaza) para que el bucle de cola pueda continuar.
- *
- * @param {Electron.WebContents} wc
- * @param {QueueItem} item
- * @param {number} index   Posición en la cola (0-based).
- * @param {number} total   Total de items.
- * @param {object} [opts]  Opciones adicionales (downloadAll, outputDir).
- * @returns {Promise<{ outputPath: string|null, exitCode: number|null }>}
- */
 function runDownload(wc, item, index, total, opts = {}) {
   return new Promise((resolve) => {
-    const binary = getBinaryPath();
+    let binary = getBinaryPath();
 
-    // ── [IPC RECEIVED] ──────────────────────────────────────────────────────
     console.log(`[IPC RECEIVED] runDownload | item ${index + 1}/${total}: ${item.url}`);
+    console.log(`[BINARY CHECK] Ruta actual de yt-dlp: ${binary}`);
 
-    // ── [BINARY CHECK] ──────────────────────────────────────────────────────
-    console.log(`[BINARY CHECK] getBinaryPath() = ${binary}`);
-
+    // Si el binario aún no existe físicamente en el disco
     if (!binary || !fs.existsSync(binary)) {
-      const msg = `[BINARY CHECK] ERROR: binario yt-dlp no disponible (${binary}).`;
-      console.error(msg);
-      log(wc, msg, 'error');
+      const isInit = getYtDlpStatus() === 'INITIALIZING';
+      const msg = isInit
+        ? 'Descargando motor yt-dlp, por favor espere a que finalice la inicialización...'
+        : `Motor yt-dlp no disponible en '${binary}'. Verifique su conexión o permisos.`;
+
+      console.error(`[BINARY CHECK] ${msg}`);
+      log(wc, msg, isInit ? 'warn' : 'error');
       emit(wc, 'app:error', { index, total, title: item.title, message: msg });
       return resolve({ outputPath: null, exitCode: -1 });
     }
 
     const args = buildArgs(item.url, opts);
 
-    // ── [SPAWN COMMAND] ─────────────────────────────────────────────────────
     console.log('[SPAWN COMMAND]:', binary);
     console.log('[SPAWN COMMAND] args:', args.join(' '));
     log(wc, `Iniciando: ${item.title}`, 'info');
@@ -273,10 +182,10 @@ function runDownload(wc, item, index, total, opts = {}) {
       child = spawn(binary, args, {
         stdio:       ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
-        env:         { ...process.env, TERM: 'dumb' }, // Evita prompts de terminal
+        env:         { ...process.env, TERM: 'dumb' },
       });
     } catch (spawnErr) {
-      const msg = `[CHILD ERROR] spawn() excepción: ${spawnErr.message}`;
+      const msg = `Excepción al invocar spawn: ${spawnErr.message}`;
       console.error(msg);
       log(wc, msg, 'error');
       emit(wc, 'app:error', { index, total, title: item.title, message: msg });
@@ -284,29 +193,22 @@ function runDownload(wc, item, index, total, opts = {}) {
     }
 
     if (!child || child.pid === undefined) {
-      const msg = `[CHILD ERROR] spawn() sin PID. Ejecutable inválido: ${binary}`;
+      const msg = `Fallo al iniciar subproceso yt-dlp: ${binary}`;
       console.error(msg);
       log(wc, msg, 'error');
       emit(wc, 'app:error', { index, total, title: item.title, message: msg });
       return resolve({ outputPath: null, exitCode: -1 });
     }
 
-    console.log(`[SPAWN COMMAND] PID: ${child.pid}`);
     _activeChild = child;
-
     let outputPath = null;
     let stdBuf     = '';
 
-    // ── [RAW STDOUT] ────────────────────────────────────────────────────────
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
-      // Log crudo para diagnóstico (preview de 200 chars)
-      const preview = chunk.replace(/\n/g, '\\n').replace(/\r/g, '\\r').substring(0, 200);
-      console.log(`[RAW STDOUT] ${preview}`);
-
       stdBuf += chunk;
       const parts = stdBuf.split('\n');
-      stdBuf = parts.pop(); // fragmento incompleto
+      stdBuf = parts.pop();
 
       for (const raw of parts) {
         const parsed = parseLine(raw);
@@ -322,7 +224,7 @@ function runDownload(wc, item, index, total, opts = {}) {
           });
         } else if (parsed.type === 'finalDest') {
           outputPath = parsed.outputPath;
-          log(wc, `Convirtiendo: ${path.basename(outputPath)}`, 'info');
+          log(wc, `Convirtiendo a MP3: ${path.basename(outputPath)}`, 'info');
         } else if (parsed.type === 'destination') {
           outputPath = parsed.outputPath;
           log(wc, `Descargando: ${path.basename(outputPath)}`, 'info');
@@ -332,66 +234,53 @@ function runDownload(wc, item, index, total, opts = {}) {
       }
     });
 
-    // ── [RAW STDERR] ────────────────────────────────────────────────────────
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
       chunk.split(/[\n\r]/)
         .map(l => l.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').trim())
         .filter(Boolean)
         .forEach(line => {
-          console.error(`[RAW STDERR] ${line}`);
+          console.error(`[STDERR] ${line}`);
           log(wc, line, 'error');
         });
     });
 
-    // ── [CHILD ERROR] ───────────────────────────────────────────────────────
     child.on('error', (err) => {
       _activeChild = null;
-      const msg = `[CHILD ERROR] ${err.code ?? 'ERR'}: ${err.message}`;
+      const msg = `Error en subproceso: ${err.message}`;
       console.error(msg);
       log(wc, msg, 'error');
       emit(wc, 'app:error', { index, total, title: item.title, message: msg });
       resolve({ outputPath: null, exitCode: -1 });
     });
 
-    // ── [CHILD CLOSED WITH CODE] ────────────────────────────────────────────
     child.on('close', (code, signal) => {
       _activeChild = null;
-      console.log(`[CHILD CLOSED WITH CODE]: ${code} | signal: ${signal} | outputPath: ${outputPath}`);
+      console.log(`[CHILD CLOSED]: code=${code} signal=${signal}`);
 
       if (code === 0 || code === null) {
-        log(wc, `✓ Completado: ${item.title}`, 'success');
+        log(wc, `✓ Completado con éxito: ${item.title}`, 'success');
         emit(wc, 'app:done', { index, total, title: item.title, outputPath });
-        resolve({ outputPath, exitCode: code ?? 0 });
+        resolve({ outputPath, exitCode: 0 });
       } else {
-        const msg = `yt-dlp salió con código ${code}${signal ? ` (signal: ${signal})` : ''}`;
-        console.error(`[CHILD CLOSED WITH CODE] ERROR: ${msg}`);
-        log(wc, `✗ Error: ${item.title} — ${msg}`, 'error');
+        const msg = `yt-dlp finalizó con código de error ${code}${signal ? ` (${signal})` : ''}`;
+        console.error(msg);
+        log(wc, `✗ Falló: ${item.title} — ${msg}`, 'error');
         emit(wc, 'app:error', { index, total, title: item.title, message: msg });
-        // Resolvemos (no rechazamos) para que la cola continúe
         resolve({ outputPath: null, exitCode: code });
       }
     });
   });
 }
 
-// ─── Gestor de confirmación de playlists ──────────────────────────────────────
+// ─── Confirmación de Playlists ────────────────────────────────────────────────
 
-/**
- * Emite un evento de confirmación de playlist al renderer y espera
- * la respuesta del usuario vía `app:playlistAnswer`.
- * Timeout de 60 s: si el usuario no responde, se descarga solo la canción.
- *
- * @param {Electron.WebContents} wc
- * @param {QueueItem} item
- * @returns {Promise<boolean>} true = descargar playlist completa.
- */
 function askPlaylistPreference(wc, item) {
   return new Promise((resolve) => {
-    const key     = item.url;
+    const key = item.url;
     const timeout = setTimeout(() => {
       _playlistPrompts.delete(key);
-      console.warn('[ipc] Timeout en confirmación de playlist. Descargando solo canción.');
+      console.warn('[ipc] Timeout en respuesta de playlist. Descargando solo canción.');
       resolve(false);
     }, 60_000);
 
@@ -407,27 +296,20 @@ function askPlaylistPreference(wc, item) {
   });
 }
 
-// ─── Procesador de cola ───────────────────────────────────────────────────────
+// ─── Procesador de Cola Secuencial ───────────────────────────────────────────
 
-/**
- * Procesa la cola completa de forma secuencial con async/await real.
- * Usa setImmediate para no bloquear el event loop al arrancar.
- *
- * @param {Electron.WebContents} wc
- * @param {string} [outputDir]  Directorio de descarga (override).
- */
 async function processQueue(wc, outputDir) {
   _stopRequested = false;
   let completed  = 0;
   let errors     = 0;
   const total    = _queue.filter(i => i.status === 'pending').length;
 
-  console.log(`[ipc] Cola iniciada: ${total} item(s) pendientes.`);
-  log(wc, `Cola iniciada: ${total} canción(es) en cola.`, 'info');
+  console.log(`[ipc] Iniciando procesamiento de ${total} elemento(s).`);
+  log(wc, `Cola iniciada: ${total} elemento(s) pendientes.`, 'info');
 
   for (let i = 0; i < _queue.length; i++) {
     if (_stopRequested) {
-      log(wc, '⏹ Cola detenida por el usuario.', 'warn');
+      log(wc, '⏹ Cola cancelada por el usuario.', 'warn');
       break;
     }
 
@@ -437,12 +319,11 @@ async function processQueue(wc, outputDir) {
     item.status = 'active';
     broadcastQueue(wc);
 
-    // Preguntar preferencia de playlist cuando sea el turno
     let downloadAll = false;
     if (item.isPlaylist) {
-      log(wc, `⚠️  Playlist detectada: ${item.title}. Esperando decisión...`, 'warn');
+      log(wc, `⚠️ Playlist detectada: ${item.title}. Esperando confirmación...`, 'warn');
       downloadAll = await askPlaylistPreference(wc, item);
-      log(wc, `Playlist: ${downloadAll ? 'descargando completa' : 'solo canción actual'}.`, 'info');
+      log(wc, `Modo playlist: ${downloadAll ? 'Descarga completa' : 'Solo una canción'}.`, 'info');
     }
 
     const result = await runDownload(wc, item, completed, total, {
@@ -450,7 +331,7 @@ async function processQueue(wc, outputDir) {
       outputDir: outputDir || getOutputDir(),
     });
 
-    if (result.exitCode === 0 || result.exitCode === null) {
+    if (result.exitCode === 0) {
       item.status = 'done';
       completed++;
     } else {
@@ -461,31 +342,22 @@ async function processQueue(wc, outputDir) {
     broadcastQueue(wc);
   }
 
-  log(wc, `🏁 Cola finalizada. ✓ ${completed} completadas, ✗ ${errors} errores.`, 'info');
+  log(wc, `🏁 Cola completada. ${completed} éxito(s), ${errors} error(es).`, 'info');
   emit(wc, 'app:queueDone', { completed, errors });
 
-  // Limpiar items procesados (done/error) de la cola
   _queue = _queue.filter(i => i.status === 'pending');
   broadcastQueue(wc);
 }
 
-// ─── Registro de handlers IPC ─────────────────────────────────────────────────
+// ─── Registro de Handlers IPC ─────────────────────────────────────────────────
 
-/**
- * Registra todos los canales IPC con validación estricta de parámetros.
- * Llamar UNA SOLA VEZ en `main.js`, ANTES de `createWindow()`.
- *
- * @param {Electron.IpcMain} ipcMain
- * @param {Electron.App}     app
- */
-function registerHandlers(ipcMain, app) {
+function registerHandlers(ipcMain, appInstance) {
 
-  // ── app:addItems ──────────────────────────────────────────────────────────
+  // Añadir elementos a la cola
   ipcMain.handle('app:addItems', (event, rawItems) => {
     if (!Array.isArray(rawItems) || rawItems.length === 0)
       return { added: 0, total: _queue.length };
 
-    // Limitar tamaño de lote (máx 1000 items) para prevenir DoS
     const itemsToProcess = rawItems.slice(0, 1000);
     let added = 0;
 
@@ -500,25 +372,24 @@ function registerHandlers(ipcMain, app) {
       const parsed = normalizeInput(input);
       if (!parsed) continue;
 
-      // Deduplicar por URL
       if (_queue.some(q => q.url === parsed.url)) continue;
       _queue.push(parsed);
       added++;
     }
 
     const wc = event.sender;
-    log(wc, `${added} elemento(s) añadidos a la cola. Total: ${_queue.length}.`, 'info');
+    log(wc, `${added} elemento(s) añadidos a la cola. Total en cola: ${_queue.length}.`, 'info');
     broadcastQueue(wc);
     return { added, total: _queue.length };
   });
 
-  // ── app:startQueue ────────────────────────────────────────────────────────
+  // Iniciar descarga de cola
   ipcMain.handle('app:startQueue', (event) => {
     const wc = event.sender;
 
     if (_activeChild) {
-      log(wc, 'Ya hay una descarga activa. Detén primero.', 'warn');
-      return { started: false, reason: 'Descarga activa' };
+      log(wc, 'Ya hay una descarga en curso.', 'warn');
+      return { started: false, reason: 'Descarga en curso' };
     }
 
     const pending = _queue.filter(i => i.status === 'pending');
@@ -527,7 +398,6 @@ function registerHandlers(ipcMain, app) {
       return { started: false, reason: 'Cola vacía' };
     }
 
-    // Lanzar sin await para devolver el IPC inmediatamente
     setImmediate(() => {
       processQueue(wc).catch(err =>
         console.error('[ipc] Error en processQueue:', err.message)
@@ -537,37 +407,35 @@ function registerHandlers(ipcMain, app) {
     return { started: true, count: pending.length };
   });
 
-  // ── app:stop ──────────────────────────────────────────────────────────────
+  // Detener descarga activa
   ipcMain.handle('app:stop', (event) => {
     _stopRequested = true;
 
     if (_activeChild && typeof _activeChild.pid === 'number') {
       try {
         if (IS_WIN) {
-          // Windows: taskkill sin shell para prevenir Command Injection
           const { execFileSync } = require('child_process');
           execFileSync('taskkill', ['/pid', String(_activeChild.pid), '/f', '/t'], { windowsHide: true });
         } else {
           _activeChild.kill('SIGTERM');
         }
-        console.log(`[ipc] Proceso ${_activeChild.pid} terminado.`);
+        console.log(`[ipc] Proceso ${_activeChild.pid} cancelado.`);
       } catch (e) {
-        console.warn('[ipc] kill() falló:', e.message);
+        console.warn('[ipc] Error al terminar proceso:', e.message);
       }
       _activeChild = null;
     }
 
-    // Resetear items activos a pending para poder relanzar
     _queue.forEach(i => { if (i.status === 'active') i.status = 'pending'; });
-    log(event.sender, 'Descarga detenida.', 'warn');
+    log(event.sender, 'Descarga detenida por el usuario.', 'warn');
     broadcastQueue(event.sender);
     return { stopped: true };
   });
 
-  // ── app:clear ─────────────────────────────────────────────────────────────
+  // Limpiar cola
   ipcMain.handle('app:clear', (event) => {
     if (_activeChild) {
-      log(event.sender, 'No se puede limpiar mientras hay una descarga activa.', 'warn');
+      log(event.sender, 'No se puede limpiar la cola mientras hay una descarga activa.', 'warn');
       return { cleared: false };
     }
     _queue = [];
@@ -576,38 +444,63 @@ function registerHandlers(ipcMain, app) {
     return { cleared: true };
   });
 
-  // ── app:openFolder ────────────────────────────────────────────────────────
+  // ── app:openFolder (Manejo Seguro y Multiplataforma) ───────────────────────
   ipcMain.handle('app:openFolder', async (event) => {
-    const dir = getOutputDir();
-    if (!dir) {
-      log(event.sender, 'Directorio de descargas no disponible.', 'error');
-      return { opened: false };
-    }
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      const result = await shell.openPath(dir);
-      if (result) {
-        log(event.sender, `No se pudo abrir carpeta: ${result}`, 'error');
-        return { opened: false, error: result };
+    let rawDir = getOutputDir();
+    if (!rawDir) {
+      try {
+        rawDir = path.join(appInstance.getPath('downloads'), 'MusicDown');
+      } catch {
+        rawDir = path.join(os.homedir(), 'Downloads', 'MusicDown');
       }
-      log(event.sender, `Carpeta abierta: ${sanitizePath(dir)}`, 'info');
-      return { opened: true, dir: sanitizePath(dir) };
+    }
+
+    // Normalización obligatoria para separadores válidos en Windows (\) y Linux (/)
+    const downloadDir = path.normalize(rawDir);
+
+    try {
+      // Verificar y crear físicamente si no existe
+      if (!fs.existsSync(downloadDir)) {
+        fs.mkdirSync(downloadDir, { recursive: true });
+        console.log(`[ipc] Carpeta creada previamente a la apertura: ${downloadDir}`);
+      }
+
+      const openResult = await shell.openPath(downloadDir);
+      if (openResult) {
+        const errorMsg = `No se pudo abrir carpeta: ${openResult}`;
+        console.error(`[ipc] ${errorMsg}`);
+        log(event.sender, errorMsg, 'error');
+        return { opened: false, error: openResult };
+      }
+
+      log(event.sender, `Carpeta abierta en el explorador: ${downloadDir}`, 'info');
+      return { opened: true, dir: downloadDir };
+
     } catch (err) {
-      log(event.sender, `Error abriendo carpeta: ${err.message}`, 'error');
+      const errorMsg = `Error al abrir directorio de descargas: ${err.message}`;
+      console.error(`[ipc] ${errorMsg}`);
+      log(event.sender, errorMsg, 'error');
       return { opened: false, error: err.message };
     }
   });
 
-  // ── app:getStatus ─────────────────────────────────────────────────────────
-  ipcMain.handle('app:getStatus', () => ({
-    binaryPath: sanitizePath(getBinaryPath()),
-    ffmpegPath: sanitizePath(getFfmpegPath()),
-    outputDir:  sanitizePath(getOutputDir()),
-    queue:      _queue,
-    active:     _activeChild !== null,
-  }));
+  // Estado general de dependencias y cola
+  ipcMain.handle('app:getStatus', () => {
+    const rawOutDir = getOutputDir() || path.normalize(path.join(appInstance.getPath('downloads'), 'MusicDown'));
+    const resolvedBin = getYtDlpPath(appInstance);
 
-  // ── app:playlistAnswer ────────────────────────────────────────────────────
+    return {
+      binaryPath: resolvedBin,
+      ffmpegPath: getFfmpegPath(),
+      outputDir:  path.normalize(rawOutDir),
+      ytdlpStatus: getYtDlpStatus(),
+      isReady:     isYtDlpReady() && fs.existsSync(resolvedBin),
+      queue:       _queue,
+      active:      _activeChild !== null,
+    };
+  });
+
+  // Respuesta de modal de playlist
   ipcMain.handle('app:playlistAnswer', (_event, payload) => {
     if (!payload || typeof payload !== 'object' || typeof payload.url !== 'string') {
       return { ok: false, reason: 'Payload inválido.' };
@@ -618,10 +511,10 @@ function registerHandlers(ipcMain, app) {
       pending.resolve(Boolean(downloadAll));
       return { ok: true };
     }
-    return { ok: false, reason: 'No había prompt pendiente para esa URL.' };
+    return { ok: false, reason: 'No había solicitud pendiente para esta URL.' };
   });
 
-  console.log('[ipc] Handlers registrados: app:addItems | app:startQueue | app:stop | app:clear | app:openFolder | app:getStatus | app:playlistAnswer');
+  console.log('[ipc] Handlers IPC registrados correctamente.');
 }
 
 module.exports = { registerHandlers };

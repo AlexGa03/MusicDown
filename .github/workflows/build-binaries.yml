@@ -1,32 +1,56 @@
-name: Build Desktop Binaries
+name: Build Desktop Binaries (Linux & Windows)
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    name: Build ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: --win
+            artifact_name: MusicDown-Windows-x64
+            artifact_path: electron-app/release/*.exe
+
+          - os: ubuntu-latest
+            target: --linux AppImage
+            artifact_name: MusicDown-Linux-AppImage
+            artifact_path: electron-app/release/*.AppImage
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: 'npm'
-          cache-dependency-path: electron-app/package-lock.json
+          cache-dependency-path: electron-app/package*.json
 
-      - name: Install dependencies
+      - name: Install system dependencies (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools libfuse2
+
+      - name: Install Node dependencies
         working-directory: electron-app
-        run: npm install
+        run: npm ci || npm install
 
-      - name: Build Windows Executable
+      - name: Build Electron App
         working-directory: electron-app
-        run: npx electron-builder --win --x64
+        run: npx electron-builder ${{ matrix.target }} --x64
 
-      - name: Upload Windows Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MusicDown-Windows-x64
-          path: electron-app/dist/*.exe
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
