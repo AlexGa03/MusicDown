@@ -104,8 +104,13 @@ WORKDIR /app
 # Copiar aplicación construida y sus node_modules desde el stage de builder
 COPY --from=builder /app/electron-app ./electron-app
 
-# Crear directorios para descargas y datos de usuario con permisos adecuados
-RUN mkdir -p /app/downloads /app/userData /root/.config
+# Crear directorios para descargas y datos de usuario.
+# /app/downloads recibe permisos 777 para garantizar lectura/escritura universal:
+#   - El proceso Electron corre como root en el contenedor
+#   - El volumen montado desde el host puede tener un UID diferente
+#   - chmod 777 asegura que cualquier proceso dentro del contenedor pueda escribir
+RUN mkdir -p /app/downloads /app/userData /root/.config \
+    && chmod 777 /app/downloads
 
 # Copiar script de inicialización y punto de entrada
 COPY entrypoint.sh /entrypoint.sh

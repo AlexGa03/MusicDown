@@ -31,6 +31,8 @@
 /** @type {{ url: string, title: string, isPlaylist: boolean, status: string }[]} */
 let queueItems     = [];
 let isDownloading  = false;
+/** @type {boolean} — se establece al recibir getStatus() con isDocker:true */
+let isDockerEnv    = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. HELPER DE LOGS (DOM + consola del navegador)
@@ -158,12 +160,29 @@ function updateButtons() {
   const btnStart  = document.getElementById('btn-start');
   const btnStop   = document.getElementById('btn-stop');
   const btnClear  = document.getElementById('btn-clear');
+  const btnFolder = document.getElementById('btn-folder');
 
   if (btnStart)  btnStart.disabled  = isDownloading || !hasPending;
   if (btnStop)   btnStop.disabled   = !isDownloading;
   if (btnClear)  btnClear.disabled  = isDownloading;
 
-  console.log(`[RENDERER] updateButtons — isDownloading=${isDownloading} hasPending=${hasPending}`);
+  // En Docker no hay gestor de archivos de escritorio; ocultar el botón
+  // y mostrar un tooltip informativo sobre el volumen montado.
+  if (btnFolder) {
+    if (isDockerEnv) {
+      btnFolder.disabled = true;
+      btnFolder.style.opacity = '0.35';
+      btnFolder.style.cursor  = 'not-allowed';
+      btnFolder.title = 'Entorno Docker: accede a /app/downloads desde el host';
+    } else {
+      btnFolder.disabled = false;
+      btnFolder.style.opacity = '';
+      btnFolder.style.cursor  = '';
+      btnFolder.title = '';
+    }
+  }
+
+  console.log(`[RENDERER] updateButtons — isDownloading=${isDownloading} hasPending=${hasPending} isDockerEnv=${isDockerEnv}`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +360,13 @@ async function handleOpenFolder() {
   try {
     const result = await window.electronAPI.openFolder();
     console.log('[RENDERER] openFolder result:', result);
+
+    if (result.docker) {
+      // En Docker, el main process ya emitió el mensaje por IPC log.
+      // Aquí añadimos una copia en la consola del renderer como refuerzo visual.
+      appendLog(result.message ?? '📦 Docker: sincroniza canciones en el volumen /app/downloads del host.', 'info');
+      return;
+    }
 
     if (!result.opened) {
       appendLog(`No se pudo abrir la carpeta: ${result.error ?? 'Desconocido'}`, 'error');
@@ -632,6 +658,15 @@ async function bootstrap() {
       appendLog('Consultando estado del sistema...', 'info');
       const status = await window.electronAPI.getStatus();
       console.log('[RENDERER] getStatus:', status);
+
+      // ── Detección de entorno Docker ──────────────────────────────────────
+      // Se establece ANTES de updateButtons() para que oculte btn-folder
+      // desde el primer render si la app está corriendo en contenedor.
+      if (status.isDocker) {
+        isDockerEnv = true;
+        console.log('[RENDERER] Modo Docker detectado. btn-folder será deshabilitado.');
+        appendLog('📦 Modo Docker: canciones sincronizadas en el volumen montado (/app/downloads).', 'info');
+      }
 
       const binOk  = !!status.binaryPath;
       const ffOk   = !!status.ffmpegPath;

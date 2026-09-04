@@ -544,15 +544,59 @@ async function ensureYtDlp(appInstance) {
 
 // ─── Exportaciones Públicas ───────────────────────────────────────────────────
 
+/**
+ * Devuelve la ruta al binario yt-dlp ya resuelto y validado.
+ *
+ * Prioridad:
+ *   1. _binaryPath (seteado por ensureYtDlp() tras descarga o validación exitosa)
+ *   2. Fallbacks del sistema (pip3: /usr/local/bin/yt-dlp, /usr/bin/yt-dlp, etc.)
+ *   3. null si no hay binario disponible
+ *
+ * NUNCA usa la ruta de userData como "ruta resuelta" si el archivo no existe ahí.
+ * @returns {string|null}
+ */
+function getBinaryPathResolved() {
+  // 1. Ruta ya validada en memoria (asignada por ensureYtDlp)
+  if (_binaryPath && fs.existsSync(_binaryPath)) {
+    return _binaryPath;
+  }
+
+  // 2. Fallbacks de sistema (Linux/Docker: pip3, apt; macOS: brew)
+  if (!IS_WIN) {
+    const globalFallbacks = [
+      '/usr/local/bin/yt-dlp',
+      '/usr/bin/yt-dlp',
+      '/opt/homebrew/bin/yt-dlp',
+    ];
+    for (const p of globalFallbacks) {
+      if (fs.existsSync(p)) return p;
+    }
+    try {
+      const w = execFileSync('which', ['yt-dlp'], { encoding: 'utf8', windowsHide: true }).trim();
+      if (w && fs.existsSync(w)) return w;
+    } catch {}
+  } else {
+    try {
+      const w = execFileSync('where', ['yt-dlp.exe'], { encoding: 'utf8', windowsHide: true })
+        .trim().split(/\r?\n/)[0].trim();
+      if (w && fs.existsSync(w)) return w;
+    } catch {}
+  }
+
+  // 3. No disponible
+  return null;
+}
+
 module.exports = {
   initYtDlp: ensureYtDlp,
   ensureYtDlp,
   getYtDlpPath,
-  getBinaryPath: () => _binaryPath || (typeof app !== 'undefined' ? getYtDlpPath(app) : null),
+  getBinaryPath: getBinaryPathResolved,
   getFfmpegPath: () => _ffmpegPath,
-  getOutputDir: () => _outputDir,
+  getOutputDir:  () => _outputDir,
   getYtDlpStatus: () => _status,
-  isYtDlpReady: () => _status === 'READY',
+  isYtDlpReady:  () => _status === 'READY',
+  isDocker:      () => IS_DOCKER,
   sanitizePath,
   validateBinary,
 };

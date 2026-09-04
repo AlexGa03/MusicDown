@@ -6,7 +6,7 @@
  */
 
 const { spawn }  = require('child_process');
-const { shell }  = require('electron');
+const { shell, BrowserWindow } = require('electron');
 const path       = require('path');
 const os         = require('os');
 const fs         = require('fs');
@@ -17,6 +17,7 @@ const {
   getOutputDir,
   getYtDlpStatus,
   isYtDlpReady,
+  isDocker,
   sanitizePath,
 } = require('./ytdlp-manager.js');
 
@@ -160,17 +161,23 @@ function parseLine(raw) {
 
 function runDownload(wc, item, index, total, opts = {}) {
   return new Promise((resolve) => {
-    let binary = getBinaryPath();
+    // getBinaryPath() resuelve con prioridad:
+    //   1. _binaryPath (validado por ensureYtDlp)
+    //   2. /usr/local/bin/yt-dlp (pip3 Docker)
+    //   3. /usr/bin/yt-dlp (apt)
+    //   4. which/where en PATH
+    //   5. null si no hay binario disponible
+    const binary = getBinaryPath();
 
     console.log(`[IPC RECEIVED] runDownload | item ${index + 1}/${total}: ${item.url}`);
-    console.log(`[BINARY CHECK] Ruta actual de yt-dlp: ${binary}`);
+    console.log(`[BINARY CHECK] Ruta efectiva de yt-dlp: ${binary ?? '(no disponible)'}`);
 
-    // Si el binario aún no existe físicamente en el disco
+    // Si el binario no existe físicamente en el disco
     if (!binary || !fs.existsSync(binary)) {
       const isInit = getYtDlpStatus() === 'INITIALIZING';
       const msg = isInit
-        ? 'Descargando motor yt-dlp, por favor espere a que finalice la inicialización...'
-        : `Motor yt-dlp no disponible en '${binary}'. Verifique su conexión o permisos.`;
+        ? 'Motor yt-dlp aún se está inicializando, por favor espere unos segundos...'
+        : `Motor yt-dlp no disponible. Ruta resuelta: '${binary ?? 'ninguna'}'. Verifique su conexión o permisos.`;
 
       console.error(`[BINARY CHECK] ${msg}`);
       log(wc, msg, isInit ? 'warn' : 'error');
@@ -453,6 +460,16 @@ function registerHandlers(ipcMain, appInstance) {
 
   // ── app:openFolder (Manejo Seguro y Multiplataforma) ───────────────────────
   ipcMain.handle('app:openFolder', async (event) => {
+    // ── Bloqueo en entorno Docker ────────────────────────────────────────────
+    // En el contenedor no hay gestor de archivos de escritorio instalado.
+    // Las descargas son accesibles directamente desde el host mediante el volumen
+    // montado (-v ~/Descargas:/app/downloads), por lo que abrir carpeta no aplica.
+    if (isDocker()) {
+      const msg = '📦 Entorno Docker: Las canciones se sincronizan en el volumen montado (/app/downloads).';
+      log(event.sender, msg, 'info');
+      return { opened: false, docker: true, dir: '/app/downloads', message: msg };
+    }
+
     let rawDir = getOutputDir();
     if (!rawDir) {
       try {
@@ -465,63 +482,73 @@ function registerHandlers(ipcMain, appInstance) {
     // Normalización obligatoria para separadores válidos en Windows (\) y Linux (/)
     const downloadDir = path.normalize(rawDir);
 
+    // ── Crear el directorio síncronamente antes de lanzar el explorador ──────
+    // shell.openPath falla silenciosamente si el directorio no existe en disco.
+    // mkdirSync con recursive:true es idempotente (no lanza si ya existe).
     try {
-      // ── Crear el directorio explícita y síncronamente antes de openPath ──
-      // shell.openPath falla silenciosamente si el directorio no existe físicamente.
-      // fs.mkdirSync con recursive:true es idempotente y no lanza si ya existe.
       if (!fs.existsSync(downloadDir)) {
         fs.mkdirSync(downloadDir, { recursive: true });
         console.log(`[ipc] Carpeta creada previamente a la apertura: ${downloadDir}`);
       }
+    } catch (mkErr) {
+      const msg = `No se pudo crear el directorio de descargas: ${mkErr.message}`;
+      console.error(`[ipc] ${msg}`);
+      log(event.sender, msg, 'error');
+      return { opened: false, error: mkErr.message };
+    }
 
-      const openResult = await shell.openPath(downloadDir);
-      if (openResult) {
-        // shell.openPath devuelve un string con el mensaje de error si falla.
-        throw new Error(openResult);
+    // ── Apertura desacoplada (sin await) para no bloquear el hilo de eventos ─
+    // En Wayland/XWayland (Hyprland, Sway, GNOME), esperar la promesa de
+    // shell.openPath() mantiene el grab del puntero activo durante toda la
+    // sesión del gestor de archivos externo, dejando el cursor atascado al
+    // cerrarlo. Lanzar sin await devuelve el control inmediatamente.
+    shell.openPath(downloadDir).then((errMsg) => {
+      if (errMsg) {
+        console.error(`[ipc] shell.openPath error: ${errMsg}`);
+        log(event.sender, `No se pudo abrir carpeta: ${errMsg}`, 'error');
       }
+    }).catch((err) => {
+      console.error(`[ipc] shell.openPath excepción: ${err.message}`);
+    });
 
-      log(event.sender, `Carpeta abierta en el explorador: ${downloadDir}`, 'info');
+    // ── Liberación de foco y cursor en Linux/Wayland ─────────────────────────
+    // webContents.focus() señala al compositor que el foco de input vuelve
+    // al renderer de Electron, liberando el puntero del grab del proceso externo.
+    // Se ejecuta inmediatamente tras el lanzamiento desacoplado.
+    if (process.platform === 'linux') {
+      try {
+        // Foco a nivel de webContents (libera el grab del puntero en Wayland)
+        event.sender.focus();
 
-      // ── Reset de foco para Linux/Wayland (Hyprland, Sway, GNOME, KDE) ─────
-      // Al abrir el gestor de archivos externo en Wayland, el compositor puede
-      // quedar con el foco "partido": el cursor se atasca en un puntero de selección
-      // y no responde a clics en la ventana de Electron.
-      // Solución: blur() + focus() con un pequeño delay fuerza al compositor a
-      // devolver el foco correctamente a la ventana de Electron.
-      if (process.platform === 'linux') {
-        const allWindows = require('electron').BrowserWindow.getAllWindows();
-        const win = allWindows.find(w => !w.isDestroyed() && w.isVisible()) || allWindows[0];
+        // Adicionalmente, blur+focus a nivel de ventana para forzar al compositor
+        // a re-evaluar el estado de foco de la ventana XWayland.
+        const win = BrowserWindow.fromWebContents(event.sender)
+          || BrowserWindow.getAllWindows().find(w => !w.isDestroyed() && w.isVisible());
         if (win && !win.isDestroyed()) {
           setTimeout(() => {
-            try {
-              win.blur();
-              win.focus();
-            } catch {}
-          }, 300);
+            try { win.blur(); win.focus(); } catch {}
+          }, 250);
         }
-      }
-
-      return { opened: true, dir: downloadDir };
-
-    } catch (err) {
-      const errorMsg = `No se pudo abrir carpeta: ${err.message}`;
-      console.error(`[ipc] ${errorMsg}`);
-      log(event.sender, errorMsg, 'error');
-      return { opened: false, error: err.message };
+      } catch {}
     }
+
+    log(event.sender, `📂 Abriendo carpeta: ${downloadDir}`, 'info');
+    return { opened: true, dir: downloadDir };
   });
 
   // Estado general de dependencias y cola
   ipcMain.handle('app:getStatus', () => {
-    const rawOutDir = getOutputDir() || path.normalize(path.join(appInstance.getPath('downloads'), 'MusicDown'));
-    const resolvedBin = getYtDlpPath(appInstance);
+    const rawOutDir   = getOutputDir() || path.normalize(path.join(appInstance.getPath('downloads'), 'MusicDown'));
+    const resolvedBin = getBinaryPath();
 
     return {
-      binaryPath: resolvedBin,
-      ffmpegPath: getFfmpegPath(),
-      outputDir:  path.normalize(rawOutDir),
+      binaryPath:  resolvedBin,
+      ffmpegPath:  getFfmpegPath(),
+      outputDir:   path.normalize(rawOutDir),
       ytdlpStatus: getYtDlpStatus(),
-      isReady:     isYtDlpReady() && fs.existsSync(resolvedBin),
+      // isReady solo es true si el binario existe físicamente en disco
+      isReady:     isYtDlpReady() && !!resolvedBin && fs.existsSync(resolvedBin),
+      isDocker:    isDocker(),
       queue:       _queue,
       active:      _activeChild !== null,
     };
