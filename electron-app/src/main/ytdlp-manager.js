@@ -221,10 +221,11 @@ function isAllowedUrl(urlString) {
 }
 
 /**
- * Descarga un archivo por HTTPS con redirecciones seguras y escritura atómica usando pipeline.
+ * Descarga un archivo por HTTPS con redirecciones seguras y escritura tolerante a NTFS.
  *
- * En Windows (NTFS), pipeline garantiza que el stream y los descriptores se cierren
- * antes de proceder a la validación de tamaño y al renombrado atómico.
+ * En Windows (NTFS), pipeline cierra el stream, pero Windows Defender suele retener un lock
+ * de inspección sobre ejecutables recién descargados. Se implementa un ciclo de reintentos
+ * para fs.renameSync con fallback automático a fs.copyFileSync + fs.unlinkSync diferido.
  *
  * @param {string} url
  * @param {string} dest
@@ -272,7 +273,7 @@ async function downloadFile(url, dest) {
         throw new Error(`Redirección ${res.statusCode} sin cabecera Location`);
       }
       currentUrl = new URL(res.headers.location, currentUrl).toString();
-      res.resume(); // Consumir respuesta para liberar socket
+      res.resume();
       continue;
     }
 
@@ -281,14 +282,13 @@ async function downloadFile(url, dest) {
       throw new Error(`HTTP ${res.statusCode} al descargar desde ${currentUrl}`);
     }
 
-    // Usar pipeline de stream/promises para garantizar que el stream se cierre al 100% en NTFS
     const fileStream = fs.createWriteStream(tmp, { flags: 'w' });
     await pipeline(res, fileStream);
     break;
   }
 
-  // Retardo de 50ms para asegurar que el kernel de Windows libere el lock de NTFS
-  await new Promise(r => setTimeout(r, 50));
+  // Margen inicial para que el kernel libere el descriptor de escritura
+  await new Promise(r => setTimeout(r, 100));
 
   let size = 0;
   try {
@@ -297,34 +297,48 @@ async function downloadFile(url, dest) {
     throw new Error(`No se pudo leer el archivo temporal en disco: ${statErr.message}`);
   }
 
-  broadcastStatus('INITIALIZING', `yt-dlp.tmp escrito (${size} bytes). Renombrando...`);
-  console.log(`[ytdlp-manager] yt-dlp.tmp escrito (${size} bytes). Renombrando...`);
+  broadcastStatus('INITIALIZING', `yt-dlp.tmp escrito (${size} bytes). Asentando binario...`);
+  console.log(`[ytdlp-manager] yt-dlp.tmp escrito (${size} bytes). Asentando binario...`);
 
   if (size < MIN_SIZE) {
     try { fs.unlinkSync(tmp); } catch {}
     throw new Error(`Archivo descargado demasiado pequeño (${size} bytes). Mínimo requerido: ${MIN_SIZE} bytes.`);
   }
 
-  // Renombrado con reintentos para mitigar file locking en NTFS / Windows Defender
-  let renamed = false;
-  let lastRenameErr = null;
-  for (let attempt = 0; attempt < 5; attempt++) {
+  // ── Renombrado / Copia tolerante a locks de NTFS y Windows Defender ──────────
+  let finalized = false;
+  let lastErr = null;
+
+  // 1. Intentar renameSync con backoff incremental (100ms, 200ms, 300ms...)
+  for (let attempt = 0; attempt < 8; attempt++) {
     try {
       if (fs.existsSync(dest)) {
-        try { fs.unlinkSync(dest); } catch {}
+        try { fs.unlinkSync(dest); } catch (_) {}
       }
       fs.renameSync(tmp, dest);
-      renamed = true;
+      finalized = true;
       break;
     } catch (err) {
-      lastRenameErr = err;
-      await new Promise(r => setTimeout(r, 80 * (attempt + 1)));
+      lastErr = err;
+      await new Promise(r => setTimeout(r, 100 * (attempt + 1)));
     }
   }
 
-  if (!renamed) {
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
-    throw new Error(`Fallo al renombrar temporal en NTFS: ${lastRenameErr ? (lastRenameErr.code || lastRenameErr.message) : 'EPERM'}`);
+  // 2. Fallback de copia directa si el handle sigue bloqueado por el antivirus
+  if (!finalized) {
+    try {
+      console.warn(`[ytdlp-manager] Rename bloqueado (${lastErr?.code}). Aplicando fallback copyFileSync...`);
+      fs.copyFileSync(tmp, dest);
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      finalized = true;
+    } catch (copyErr) {
+      lastErr = copyErr;
+    }
+  }
+
+  if (!finalized) {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+    throw new Error(`Fallo al asentar binario en NTFS (${lastErr?.code || 'EPERM'}): ${lastErr?.message}`);
   }
 }
 
