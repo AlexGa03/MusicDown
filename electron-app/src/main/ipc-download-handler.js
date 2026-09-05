@@ -17,11 +17,15 @@ const {
   getOutputDir,
   getYtDlpStatus,
   isYtDlpReady,
+  ensureYtDlp,
+  resolveFfmpeg,
   isDocker,
   sanitizePath,
+  MIN_SIZE,
 } = require('./ytdlp-manager.js');
 
 const IS_WIN = process.platform === 'win32';
+let _appInstance = null;
 
 // ─── Utilidades de Sanitización y Validación ─────────────────────────────────
 
@@ -91,9 +95,8 @@ function broadcastQueue(wc) {
 
 function buildArgs(url, opts = {}) {
   const {
-    downloadAll    = false,
-    outputDir      = getOutputDir() || path.normalize(path.join(os.homedir(), 'Downloads', 'MusicDown')),
-    ffmpegLocation = getFfmpegPath(),
+    downloadAll = false,
+    outputDir   = getOutputDir() || path.normalize(path.join(os.homedir(), 'Downloads', 'MusicDown')),
   } = opts;
 
   const normalizedOutDir = path.normalize(outputDir);
@@ -118,7 +121,8 @@ function buildArgs(url, opts = {}) {
 
   args.push(downloadAll ? '--yes-playlist' : '--no-playlist');
 
-  if (ffmpegLocation && typeof ffmpegLocation === 'string' && fs.existsSync(ffmpegLocation)) {
+  const ffmpegLocation = opts.ffmpegLocation || getFfmpegPath(_appInstance);
+  if (ffmpegLocation && fs.existsSync(ffmpegLocation)) {
     args.push(
       '-x',
       '--audio-format', 'mp3',
@@ -126,8 +130,8 @@ function buildArgs(url, opts = {}) {
       '--ffmpeg-location', ffmpegLocation
     );
   } else {
-    console.warn('[ipc] FFmpeg no disponible. Descargando stream original sin conversión.');
-    args.push('-f', 'bestaudio');
+    console.warn('[ipc] FFmpeg no resuelto en buildArgs. Buscando en PATH global...');
+    args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
   }
 
   args.push('-o', path.join(normalizedOutDir, '%(title)s.%(ext)s'));
@@ -160,27 +164,46 @@ function parseLine(raw) {
 // ─── Ejecución de Descarga Individual ────────────────────────────────────────
 
 function runDownload(wc, item, index, total, opts = {}) {
-  return new Promise((resolve) => {
-    // getBinaryPath() resuelve con prioridad:
-    //   1. _binaryPath (validado por ensureYtDlp)
-    //   2. /usr/local/bin/yt-dlp (pip3 Docker)
-    //   3. /usr/bin/yt-dlp (apt)
-    //   4. which/where en PATH
-    //   5. null si no hay binario disponible
-    const binary = getYtDlpPath();
+  return new Promise(async (resolve) => {
+    // Si la inicialización del motor aún está en curso, esperar antes de spawn
+    if (!isYtDlpReady()) {
+      try {
+        await ensureYtDlp(_appInstance);
+      } catch (_) {}
+    }
+
+    const binary = getYtDlpPath(_appInstance);
 
     console.log(`[IPC RECEIVED] runDownload | item ${index + 1}/${total}: ${item.url}`);
     console.log(`[BINARY CHECK] Ruta efectiva de yt-dlp: ${binary ?? '(no disponible)'}`);
 
     // Si el binario no existe físicamente en el disco
+    const minSize = typeof MIN_SIZE === 'number' ? MIN_SIZE : 1_000_000;
     if (!binary || !fs.existsSync(binary)) {
       const isInit = getYtDlpStatus() === 'INITIALIZING';
       const msg = isInit
-        ? 'Motor yt-dlp aún se está inicializando, por favor espere unos segundos...'
+        ? 'Motor yt-dlp aún se está descargando/inicializando, por favor espere unos segundos...'
         : `Motor yt-dlp no disponible. Ruta resuelta: '${binary ?? 'ninguna'}'. Verifique su conexión o permisos.`;
 
       console.error(`[BINARY CHECK] ${msg}`);
       log(wc, msg, isInit ? 'warn' : 'error');
+      emit(wc, 'app:error', { index, total, title: item.title, message: msg });
+      return resolve({ outputPath: null, exitCode: -1 });
+    }
+
+    try {
+      const stat = fs.statSync(binary);
+      if (stat.size < minSize) {
+        const msg = `El binario yt-dlp en '${binary}' está corrupto o incompleto (${stat.size} bytes). Reintentando validación...`;
+        console.error(`[BINARY CHECK] ${msg}`);
+        log(wc, msg, 'error');
+        emit(wc, 'app:error', { index, total, title: item.title, message: msg });
+        return resolve({ outputPath: null, exitCode: -1 });
+      }
+    } catch (statErr) {
+      const msg = `Error al verificar archivo yt-dlp: ${statErr.message}`;
+      console.error(`[BINARY CHECK] ${msg}`);
+      log(wc, msg, 'error');
       emit(wc, 'app:error', { index, total, title: item.title, message: msg });
       return resolve({ outputPath: null, exitCode: -1 });
     }
@@ -196,6 +219,7 @@ function runDownload(wc, item, index, total, opts = {}) {
       child = spawn(binary, args, {
         stdio:       ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
+        shell:       false,
         env:         { ...process.env, TERM: 'dumb' },
       });
     } catch (spawnErr) {
@@ -261,8 +285,13 @@ function runDownload(wc, item, index, total, opts = {}) {
 
     child.on('error', (err) => {
       _activeChild = null;
-      const msg = `Error en subproceso: ${err.message}`;
-      console.error(msg);
+      let msg = `Error al ejecutar yt-dlp (${err.code || 'UNKNOWN'}): ${err.message}`;
+      if (err.code === 'ENOENT') {
+        msg = `No se encontró el ejecutable yt-dlp en: "${binary}". Verifique que el archivo no haya sido bloqueado o eliminado por el antivirus en Windows.`;
+      } else if (err.code === 'EPERM' || err.code === 'EACCES') {
+        msg = `Permiso denegado al ejecutar: "${binary}". Verifique permisos de usuario o configuración de seguridad/antivirus en Windows.`;
+      }
+      console.error('[SPAWN ERROR]:', msg);
       log(wc, msg, 'error');
       emit(wc, 'app:error', { index, total, title: item.title, message: msg });
       resolve({ outputPath: null, exitCode: -1 });
@@ -321,6 +350,22 @@ async function processQueue(wc, outputDir) {
   console.log(`[ipc] Iniciando procesamiento de ${total} elemento(s).`);
   log(wc, `Cola iniciada: ${total} elemento(s) pendientes.`, 'info');
 
+  // ── Sincronización Bloqueante con el Motor yt-dlp ──────────────────────────
+  // Si la inicialización o descarga en Windows aún está en progreso, esperamos
+  // a que termine antes de procesar los ítems para evitar errores de archivo ausente.
+  if (!isYtDlpReady()) {
+    log(wc, '⏳ Esperando a que el motor yt-dlp finalice su inicialización y verificación en disco...', 'info');
+    try {
+      await ensureYtDlp(_appInstance);
+    } catch (initErr) {
+      const errMsg = `Fallo crítico: El motor yt-dlp no se pudo inicializar (${initErr.message}).`;
+      log(wc, errMsg, 'error');
+      emit(wc, 'app:error', { index: 0, total, title: 'Motor yt-dlp', message: errMsg });
+      emit(wc, 'app:queueDone', { completed: 0, errors: total });
+      return;
+    }
+  }
+
   for (let i = 0; i < _queue.length; i++) {
     if (_stopRequested) {
       log(wc, '⏹ Cola cancelada por el usuario.', 'warn');
@@ -366,6 +411,7 @@ async function processQueue(wc, outputDir) {
 // ─── Registro de Handlers IPC ─────────────────────────────────────────────────
 
 function registerHandlers(ipcMain, appInstance) {
+  _appInstance = appInstance;
 
   // Añadir elementos a la cola
   ipcMain.handle('app:addItems', (event, rawItems) => {
@@ -539,18 +585,22 @@ function registerHandlers(ipcMain, appInstance) {
   // Estado general de dependencias y cola
   ipcMain.handle('app:getStatus', () => {
     const rawOutDir   = getOutputDir() || path.normalize(path.join(appInstance.getPath('downloads'), 'MusicDown'));
-    const resolvedBin = getBinaryPath();
+    const resolvedBin = getYtDlpPath(appInstance);
+    const minSize     = typeof MIN_SIZE === 'number' ? MIN_SIZE : 1_000_000;
+    const binExists   = Boolean(resolvedBin && fs.existsSync(resolvedBin) && fs.statSync(resolvedBin).size >= minSize);
+    const ffmpegPath  = getFfmpegPath(appInstance);
 
     return {
-      binaryPath:  resolvedBin,
-      ffmpegPath:  getFfmpegPath(),
-      outputDir:   path.normalize(rawOutDir),
-      ytdlpStatus: getYtDlpStatus(),
-      // isReady solo es true si el binario existe físicamente en disco
-      isReady:     isYtDlpReady() && !!resolvedBin && fs.existsSync(resolvedBin),
-      isDocker:    isDocker(),
-      queue:       _queue,
-      active:      _activeChild !== null,
+      binaryPath:       resolvedBin,
+      binaryPathExists: binExists,
+      ffmpegPath:       ffmpegPath,
+      outputDir:        path.normalize(rawOutDir),
+      ytdlpStatus:      getYtDlpStatus(),
+      // isReady solo es true si el binario existe físicamente en disco y tiene tamaño válido
+      isReady:          isYtDlpReady() && binExists,
+      isDocker:         isDocker(),
+      queue:            _queue,
+      active:           _activeChild !== null,
     };
   });
 

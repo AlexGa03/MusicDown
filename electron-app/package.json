@@ -30,14 +30,10 @@
       "assets/**/*"
     ],
 
-    "extraFiles": [
+    "extraResources": [
       {
-        "from": "backend/bin/ffmpeg",
-        "to":   "backend/bin/ffmpeg"
-      },
-      {
-        "from":   "backend/bin/ffmpeg.exe",
-        "to":     "backend/bin/ffmpeg.exe",
+        "from": "bin",
+        "to": "bin",
         "filter": ["**/*"]
       }
     ],

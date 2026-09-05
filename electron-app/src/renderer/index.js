@@ -668,25 +668,35 @@ async function bootstrap() {
         appendLog('📦 Modo Docker: canciones sincronizadas en el volumen montado (/app/downloads).', 'info');
       }
 
-      const binOk  = !!status.binaryPath;
-      const ffOk   = !!status.ffmpegPath;
+      const binOk  = Boolean(status.isReady);
+      const ffOk   = Boolean(status.ffmpegPath);
 
       const indicator = document.getElementById('status-indicator');
       if (indicator) {
-        indicator.textContent = binOk ? `yt-dlp OK` : `⚠️ yt-dlp no disponible`;
-        indicator.className   = `text-xs font-mono no-drag ${binOk ? 'text-green-400' : 'text-red-400'}`;
+        if (status.isReady) {
+          indicator.textContent = 'yt-dlp OK';
+          indicator.className   = 'text-xs font-mono no-drag text-green-400';
+        } else if (status.ytdlpStatus === 'INITIALIZING') {
+          indicator.textContent = '⏳ Descargando yt-dlp...';
+          indicator.className   = 'text-xs font-mono no-drag text-yellow-400 animate-pulse';
+        } else {
+          indicator.textContent = '⚠️ yt-dlp no disponible';
+          indicator.className   = 'text-xs font-mono no-drag text-red-400';
+        }
       }
 
       appendLog(
         binOk
           ? `yt-dlp: Motor de descargas listo (${status.binaryPath}).`
-          : `⚠️ yt-dlp no disponible. Ruta: '${status.binaryPath || 'ninguna'}'. Se intentará descargar automáticamente.`,
-        binOk ? 'success' : 'warn'
+          : (status.ytdlpStatus === 'INITIALIZING'
+              ? '⏳ yt-dlp: Descargando motor oficial en segundo plano...'
+              : `⚠️ yt-dlp no disponible. Ruta: '${status.binaryPath || 'ninguna'}'. Se intentará descargar automáticamente.`),
+        binOk ? 'success' : (status.ytdlpStatus === 'INITIALIZING' ? 'info' : 'warn')
       );
 
       appendLog(
         ffOk
-          ? 'ffmpeg: Conversor de audio listo.'
+          ? `ffmpeg: Conversor de audio listo (${status.ffmpegPath}).`
           : '⚠️ ffmpeg no encontrado. Se descargará audio sin conversión a MP3.',
         ffOk ? 'success' : 'warn'
       );
